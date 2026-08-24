@@ -1,4 +1,4 @@
-# Bayabas v0.10.12
+# Bayabas v0.10.14
 
 The selected output directory is the single engagement root:
 
@@ -205,3 +205,40 @@ individually; invalid ones are skipped and reported together in one
 `[!] Skipped N invalid target(s): ...` line, and the run proceeds with
 everything that's actually valid. It only still dies if literally nothing
 in the file was valid.
+
+
+## v0.10.13 Parallel target resolution + progress output
+
+`split_targets()` -- called right after "Run IPv6 scans (-6) as well?" --
+resolved every hostname target one at a time, sequentially, with zero
+progress output. This was fine for a handful of targets, but for a
+target list in the thousands (subdomain enumeration output, a cloud
+asset inventory, etc.) it could legitimately take a very long time while
+printing nothing at all, which is indistinguishable from a hang.
+
+Hostname resolution in `split_targets()` now runs concurrently across a
+thread pool (16 workers, matching the same pattern and default worker
+count `Core/resolve.py` already uses for its own preflight pass), and
+prints an upfront lookup count plus periodic `[*] Resolved N/M hostname
+lookup(s)...` progress lines as results come in. Raw IP/CIDR targets are
+unaffected -- they never needed resolution and are bucketed immediately
+with no DNS calls at all.
+
+
+## v0.10.14 Scan output logging
+
+A Screen-launched scan command's actual stdout/stderr previously went
+only to the Screen session's own terminal, with nothing captured to
+disk. Since a Screen session closes itself automatically the moment its
+wrapped command exits, a scan that failed fast (a bad nmap argument, a
+permissions issue, etc.) left no way to ever see *why* -- only the exit
+code survived, in `[!] <label> failed` messages with no further detail.
+
+Each job's command now pipes through `tee` into `<label>.log` inside its
+scan directory (e.g. `Scans/IPv4/Initial/IPv4_initial_port_scan.log`),
+preserving the exact same live view for anyone attached via `screen -r`
+while also persisting everything to disk. `PIPESTATUS[0]`, not `$?`, is
+used to capture the wrapped command's real exit code rather than `tee`'s.
+Whenever a job's exit code is non-zero, `wait_jobs()` now also prints
+`[!] Full output saved to: <path>` immediately, pointing straight at the
+real error instead of just a bare "failed" message.

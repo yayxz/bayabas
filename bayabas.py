@@ -31,7 +31,7 @@ from Core import resolve as core_resolve
 from typing import Any, Iterable
 
 APP = "Bayabas"
-VERSION = "0.10.12"
+VERSION = "0.10.14"
 ROOT = Path(__file__).resolve().parent
 MODULES_DIR = ROOT / "Modules"
 
@@ -118,6 +118,7 @@ class ScreenJob:
     done_file: Path
     exit_file: Path
     wrapper: Path
+    log_file: Path
     started: float
 
 
@@ -370,11 +371,13 @@ def split_targets(
     targets: list[str],
     ipv6_enabled: bool,
     dns_server: str | None = None,
+    workers: int = 16,
 ) -> tuple[list[str], list[str], set[tuple[str, str, str, int]]]:
     ipv4: set[str] = set()
     ipv6: set[str] = set()
     mappings: set[tuple[str, str, str, int]] = set()
 
+    hostnames: list[str] = []
     for target in targets:
         kind = classify_target(target)
         if kind == "ipv4":
@@ -383,14 +386,40 @@ def split_targets(
             if ipv6_enabled:
                 ipv6.add(target)
         else:
-            hostname = target.rstrip(".").lower()
-            for address in resolve_hostname(hostname, 4, dns_server):
-                ipv4.add(address)
-                mappings.add((hostname, address, "forward-target", 4))
-            if ipv6_enabled:
-                for address in resolve_hostname(hostname, 6, dns_server):
-                    ipv6.add(address)
-                    mappings.add((hostname, address, "forward-target", 6))
+            hostnames.append(target.rstrip(".").lower())
+
+    if hostnames:
+        families = [4, 6] if ipv6_enabled else [4]
+        lookups = [(hostname, family) for hostname in hostnames for family in families]
+
+        # A large target list (thousands of hostnames, common with
+        # subdomain enumeration or cloud asset inventories) resolved one
+        # at a time here was slow enough to look identical to a hang, with
+        # zero feedback either way. Resolving concurrently -- the same
+        # pattern Core/resolve.py already uses for its own preflight pass
+        # -- and reporting progress along the way fixes both problems.
+        family_word = "family" if len(families) == 1 else "families"
+        print(
+            f"[*] Resolving {len(hostnames)} hostname target(s) "
+            f"({len(lookups)} lookup(s) across {len(families)} address {family_word})..."
+        )
+
+        def do_lookup(item: tuple[str, int]) -> tuple[str, int, set[str]]:
+            hostname, family = item
+            return hostname, family, resolve_hostname(hostname, family, dns_server)
+
+        completed = 0
+        report_every = max(1, len(lookups) // 20)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(do_lookup, item) for item in lookups]
+            for future in concurrent.futures.as_completed(futures):
+                hostname, family, addresses = future.result()
+                for address in addresses:
+                    (ipv4 if family == 4 else ipv6).add(address)
+                    mappings.add((hostname, address, "forward-target", family))
+                completed += 1
+                if completed % report_every == 0 or completed == len(lookups):
+                    print(f"[*] Resolved {completed}/{len(lookups)} hostname lookup(s)...")
 
     return sorted(ipv4), sorted(ipv6), mappings
 
@@ -689,18 +718,28 @@ def make_job(screen: str, session: str, label: str, command: list[str], work_dir
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", label)
     done = work_dir / f".{safe}.done"
     exit_file = work_dir / f".{safe}.exit"
+    log_file = work_dir / f"{safe}.log"
     wrapper = work_dir / f"run_{safe}.sh"
+    # The command's stdout/stderr previously went straight to the Screen
+    # session's own terminal only -- nothing was ever captured to disk, so
+    # a failure's actual error message was unrecoverable the moment the
+    # session closed (which happens automatically once the command exits).
+    # Piping through `tee` keeps the live view intact for anyone attached
+    # via `screen -r` while also persisting everything to log_file.
+    # PIPESTATUS[0] (not $?) is required to get the real command exit code
+    # rather than tee's own exit code.
     wrapper.write_text(
         "#!/usr/bin/env bash\nset +e\n"
         + " ".join(shlex.quote(x) for x in command)
-        + "\ncode=$?\nprintf '%s\\n' \"$code\" > "
+        + " 2>&1 | tee " + shlex.quote(str(log_file))
+        + "\ncode=${PIPESTATUS[0]}\nprintf '%s\\n' \"$code\" > "
         + shlex.quote(str(exit_file))
         + "\ntouch " + shlex.quote(str(done))
         + "\nexit \"$code\"\n",
         encoding="utf-8",
     )
     wrapper.chmod(0o700)
-    return ScreenJob(session, label, command, work_dir, done, exit_file, wrapper, time.monotonic())
+    return ScreenJob(session, label, command, work_dir, done, exit_file, wrapper, log_file, time.monotonic())
 
 
 def start_jobs(screen: str, jobs: list[ScreenJob]) -> None:
@@ -725,6 +764,8 @@ def wait_jobs(screen: str, jobs: list[ScreenJob]) -> dict[str, int]:
                 elapsed = int(time.monotonic() - job.started)
                 results[session] = code
                 print(f"\a[*] {job.label} completed after {elapsed}s (exit {code}).")
+                if code != 0:
+                    print(f"[!] Full output saved to: {job.log_file}")
                 remaining.pop(session)
             if remaining:
                 time.sleep(2)
