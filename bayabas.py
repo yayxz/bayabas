@@ -8,6 +8,7 @@ Use only against systems you own or are explicitly authorized to assess.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import importlib.util
 import ipaddress
 import json
@@ -25,13 +26,14 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+from Core import resolve as core_resolve
 from typing import Any, Iterable
 
 APP = "Bayabas"
-VERSION = "0.7.0"
+VERSION = "0.10.12"
 ROOT = Path(__file__).resolve().parent
 MODULES_DIR = ROOT / "Modules"
-SCANS_DIR = ROOT / "Scans"
 
 HOSTNAME_RE = re.compile(
     r"^(?=.{1,253}\.?$)(?!-)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
@@ -40,12 +42,24 @@ HOSTNAME_RE = re.compile(
 TIME_RE = re.compile(r"^\d+(?:ms|s|m|h)?$", re.I)
 
 
+CURRENT_ASSESSMENT_PATH: Path | None = None
+ACTIVE_SCREEN_SESSIONS: set[str] = set()
+
+
+class GracefulInterrupt(Exception):
+    """Raised when the operator requests a graceful Bayabas exit."""
+
+
+
+
 @dataclass(frozen=True)
 class PortPlan:
     args: list[str]
     tcp: bool
     udp: bool
     description: str
+    tcp_ports: tuple[int, ...] = ()
+    udp_ports: tuple[int, ...] = ()
 
 
 @dataclass
@@ -67,6 +81,7 @@ class FamilyContext:
     flat_db_path: Path
     hostname_map_path: Path
     resolutions_path: Path
+    hosts_path: Path
     scan_id: int | None = None
     final_output_base: Path | None = None
 
@@ -158,6 +173,44 @@ def valid_dns(value: str) -> bool:
         return bool(HOSTNAME_RE.fullmatch(value))
 
 
+
+def valid_assessment_name(value: str) -> bool:
+    """Allow readable directory names without path traversal or separators."""
+    if not value or value in {".", ".."}:
+        return False
+    if "/" in value or "\\" in value or "\x00" in value:
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,99}", value))
+
+
+def resolve_assessment_root(base_output: str, assessment_name: str) -> Path:
+    """
+    Resolve and validate the user-selected assessment directory.
+
+    The base output directory may already exist or may be created. The final
+    assessment directory must not already exist, preventing accidental
+    overwrite of prior scan data.
+    """
+    base = Path(base_output).expanduser().resolve()
+
+    if base.exists() and not base.is_dir():
+        die(f"Base output path is not a directory: {base}")
+
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        die(f"Could not create base output directory {base}: {exc}")
+
+    assessment_root = base / assessment_name
+    if assessment_root.exists():
+        die(
+            "Assessment output already exists and will not be overwritten: "
+            f"{assessment_root}"
+        )
+
+    return assessment_root
+
+
 def ensure_dependencies() -> tuple[str, str]:
     nmap = shutil.which("nmap")
     screen = shutil.which("screen")
@@ -191,28 +244,133 @@ def load_targets(raw: str) -> list[str]:
         values = [x.strip() for x in raw.split(",") if x.strip()]
     if not values:
         die("No targets supplied.")
+
     result: list[str] = []
     seen: set[str] = set()
+    invalid: list[str] = []
     for value in values:
-        classify_target(value)
+        try:
+            classify_target(value)
+        except ValueError:
+            # A target list of any real size (subdomain enumeration output,
+            # a cloud asset inventory, etc.) will realistically contain
+            # some malformed entries. One bad line shouldn't abort the
+            # whole run -- skip it, report it clearly, and keep going with
+            # everything that's actually valid.
+            invalid.append(value)
+            continue
         if value not in seen:
             seen.add(value)
             result.append(value)
+
+    if invalid:
+        print(
+            f"[!] Skipped {len(invalid)} invalid target(s) (not a valid IP/CIDR/hostname): "
+            + ", ".join(repr(v) for v in invalid)
+        )
+
+    if not result:
+        die("No valid targets remained after filtering invalid entries.")
+
     return result
 
 
-def resolve_hostname(hostname: str, family: int) -> set[str]:
+def resolve_hostname(
+    hostname: str,
+    family: int,
+    dns_server: str | None = None,
+    timeout: float = 5.0,
+) -> set[str]:
+    """
+    Resolve a hostname to addresses for the given IP family.
+
+    If dns_server is set, queries it explicitly via the same `host`
+    command Core/resolve.py already uses, so a custom engagement DNS
+    server configured at the earlier prompt is actually honored here too
+    -- not just during the separate preflight resolution pass. With no
+    dns_server, falls back to the system resolver, which is what handles
+    ordinary internet-accessible hostnames.
+
+    Either path is bounded by `timeout`. A single slow or unreachable
+    hostname must never be able to hang the whole run with no feedback --
+    it's logged and treated as unresolved so the tool can keep going.
+    """
+    if dns_server:
+        return _resolve_via_dns_server(hostname, family, dns_server, timeout)
+    return _resolve_via_system_resolver(hostname, family, timeout)
+
+
+def _resolve_via_system_resolver(hostname: str, family: int, timeout: float) -> set[str]:
     af = socket.AF_INET if family == 4 else socket.AF_INET6
+
+    def lookup() -> set[str]:
+        try:
+            return {
+                item[4][0]
+                for item in socket.getaddrinfo(
+                    hostname.rstrip("."), None, family=af, type=socket.SOCK_STREAM
+                )
+            }
+        except socket.gaierror:
+            return set()
+
+    # socket.getaddrinfo() ignores socket.setdefaulttimeout() -- it's a
+    # blocking libc call, not a socket read -- so the only reliable way
+    # to bound it is to run it on a worker thread and give up waiting.
+    # The worker itself is left to finish in the background; Python
+    # cannot forcibly kill it, but the caller is no longer blocked on it.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(lookup)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            print(
+                f"[!] DNS resolution timed out after {timeout:g}s for "
+                f"{hostname} (system resolver); treating as unresolved."
+            )
+            return set()
+
+
+_HOST_ADDRESS_RE = re.compile(r"has (?:address|IPv6 address) (\S+)")
+
+
+def _resolve_via_dns_server(
+    hostname: str, family: int, dns_server: str, timeout: float
+) -> set[str]:
+    record_type = "A" if family == 4 else "AAAA"
+    command = ["host", "-t", record_type, hostname.rstrip("."), dns_server]
     try:
-        return {
-            item[4][0]
-            for item in socket.getaddrinfo(hostname.rstrip("."), None, family=af, type=socket.SOCK_STREAM)
-        }
-    except socket.gaierror:
+        completed = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            f"[!] DNS resolution timed out after {timeout:g}s for "
+            f"{hostname} (server {dns_server}); treating as unresolved."
+        )
         return set()
+    except FileNotFoundError:
+        print("[!] 'host' command not found; falling back to system resolver.")
+        return _resolve_via_system_resolver(hostname, family, timeout)
+
+    addresses: set[str] = set()
+    for line in completed.stdout.splitlines():
+        match = _HOST_ADDRESS_RE.search(line)
+        if match:
+            addresses.add(match.group(1).rstrip("."))
+    return addresses
 
 
-def split_targets(targets: list[str], ipv6_enabled: bool) -> tuple[list[str], list[str], set[tuple[str, str, str, int]]]:
+def split_targets(
+    targets: list[str],
+    ipv6_enabled: bool,
+    dns_server: str | None = None,
+) -> tuple[list[str], list[str], set[tuple[str, str, str, int]]]:
     ipv4: set[str] = set()
     ipv6: set[str] = set()
     mappings: set[tuple[str, str, str, int]] = set()
@@ -226,15 +384,35 @@ def split_targets(targets: list[str], ipv6_enabled: bool) -> tuple[list[str], li
                 ipv6.add(target)
         else:
             hostname = target.rstrip(".").lower()
-            for address in resolve_hostname(hostname, 4):
+            for address in resolve_hostname(hostname, 4, dns_server):
                 ipv4.add(address)
                 mappings.add((hostname, address, "forward-target", 4))
             if ipv6_enabled:
-                for address in resolve_hostname(hostname, 6):
+                for address in resolve_hostname(hostname, 6, dns_server):
                     ipv6.add(address)
                     mappings.add((hostname, address, "forward-target", 6))
 
     return sorted(ipv4), sorted(ipv6), mappings
+
+
+def _expand_port_tokens(value: str) -> set[int]:
+    ports: set[int] = set()
+    for token in (part.strip() for part in value.split(",")):
+        if not token:
+            continue
+        if "-" in token:
+            left_text, right_text = token.split("-", 1)
+            if not left_text.isdigit() or not right_text.isdigit():
+                raise ValueError(f"Invalid port range: {token}")
+            left, right = int(left_text), int(right_text)
+            if not 1 <= left <= right <= 65535:
+                raise ValueError(f"Invalid port range: {token}")
+            ports.update(range(left, right + 1))
+        else:
+            if not token.isdigit() or not 1 <= int(token) <= 65535:
+                raise ValueError(f"Invalid port: {token}")
+            ports.add(int(token))
+    return ports
 
 
 def parse_port_plan(value: str) -> PortPlan:
@@ -248,19 +426,42 @@ def parse_port_plan(value: str) -> PortPlan:
     if not raw:
         raise ValueError("Empty port selection.")
 
-    tcp = bool(re.search(r"(?:^|,)T:", raw, re.I))
-    udp = bool(re.search(r"(?:^|,)U:", raw, re.I))
-    if not tcp and not udp:
-        tcp = True
-    for token in re.findall(r"\d+(?:-\d+)?", raw):
-        if "-" in token:
-            left, right = map(int, token.split("-", 1))
-            if not 1 <= left <= right <= 65535:
-                raise ValueError(f"Invalid port range: {token}")
-        elif not 1 <= int(token) <= 65535:
-            raise ValueError(f"Invalid port: {token}")
-    return PortPlan(["-p", raw], tcp, udp, raw)
+    tcp_ports: set[int] = set()
+    udp_ports: set[int] = set()
 
+    matches = list(re.finditer(r"(?:^|,)([TU]):", raw, re.I))
+    if not matches:
+        tcp_ports = _expand_port_tokens(raw)
+    else:
+        for index, match in enumerate(matches):
+            protocol = match.group(1).upper()
+            payload_start = match.end()
+            payload_end = matches[index + 1].start() if index + 1 < len(matches) else len(raw)
+            payload = raw[payload_start:payload_end].strip(",")
+            values = _expand_port_tokens(payload)
+            if protocol == "T":
+                tcp_ports.update(values)
+            else:
+                udp_ports.update(values)
+
+    if not tcp_ports and not udp_ports:
+        raise ValueError("No valid ports supplied.")
+
+    normalized_parts = []
+    if tcp_ports:
+        normalized_parts.append("T:" + ",".join(map(str, sorted(tcp_ports))))
+    if udp_ports:
+        normalized_parts.append("U:" + ",".join(map(str, sorted(udp_ports))))
+    normalized = ",".join(normalized_parts)
+
+    return PortPlan(
+        ["-p", normalized],
+        bool(tcp_ports),
+        bool(udp_ports),
+        normalized,
+        tuple(sorted(tcp_ports)),
+        tuple(sorted(udp_ports)),
+    )
 
 def collect_scan_options(args: argparse.Namespace) -> tuple[PortPlan, list[str]]:
     quick = args.quick if args.non_interactive else yes_no("Use quick scan (-F)?", False)
@@ -310,8 +511,8 @@ def collect_scan_options(args: argparse.Namespace) -> tuple[PortPlan, list[str]]
 
 def make_family_context(assessment_root: Path, family: int, targets: list[str]) -> FamilyContext:
     label = f"IPv{family}"
-    scan_root = assessment_root / label
-    db_root = assessment_root / "Host_DB" / label
+    scan_root = assessment_root / "Scans" / label
+    db_root = assessment_root / "Database" / label
     discovery = scan_root / "Discovery"
     initial = scan_root / "Initial"
     final = scan_root / "Final"
@@ -335,6 +536,7 @@ def make_family_context(assessment_root: Path, family: int, targets: list[str]) 
         flat_db_path=db_root / "host_port.txt",
         hostname_map_path=db_root / "hostname_ip_mapping.txt",
         resolutions_path=db_root / "resolutions.txt",
+        hosts_path=db_root / "hosts.txt",
     )
 
 
@@ -504,6 +706,7 @@ def make_job(screen: str, session: str, label: str, command: list[str], work_dir
 def start_jobs(screen: str, jobs: list[ScreenJob]) -> None:
     for job in jobs:
         subprocess.run([screen, "-DmS", job.session, "bash", str(job.wrapper)], check=True)
+        ACTIVE_SCREEN_SESSIONS.add(job.session)
         print(f"[*] Started {job.label} in Screen session {job.session!r}")
 
 
@@ -525,16 +728,22 @@ def wait_jobs(screen: str, jobs: list[ScreenJob]) -> dict[str, int]:
                 remaining.pop(session)
             if remaining:
                 time.sleep(2)
-    except KeyboardInterrupt:
-        for job in jobs:
-            subprocess.run([screen, "-S", job.session, "-X", "quit"], check=False)
-        raise SystemExit(130)
+    except KeyboardInterrupt as exc:
+        sessions = ", ".join(sorted(remaining))
+        print(
+            "\n[!] Interrupt received. Active scans remain detached in Screen: "
+            f"{sessions}",
+            file=sys.stderr,
+        )
+        raise GracefulInterrupt from exc
     finally:
         for job in jobs:
-            subprocess.run(
-                [screen, "-S", job.session, "-X", "quit"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
-            )
+            if job.done_file.exists():
+                ACTIVE_SCREEN_SESSIONS.discard(job.session)
+                subprocess.run(
+                    [screen, "-S", job.session, "-X", "quit"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
+                )
     return results
 
 
@@ -556,12 +765,13 @@ def collect_family_mappings(
     family: int,
     explicit: set[tuple[str, str, str, int]],
     live_hosts: list[str],
+    dns_server: str | None = None,
 ) -> set[tuple[str, str, str]]:
     result = {(h, a, s) for h, a, s, f in explicit if f == family}
     for address in live_hosts:
         for hostname in reverse_names(address):
             result.add((hostname, address, "reverse-ptr"))
-            for resolved in resolve_hostname(hostname, family):
+            for resolved in resolve_hostname(hostname, family, dns_server):
                 result.add((hostname, resolved, "forward-ptr"))
     return result
 
@@ -590,6 +800,533 @@ def write_resolution_files(context: FamilyContext, pairs: set[tuple[str, str, st
     if not multi_addresses:
         lines.append("none")
     context.hostname_map_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+
+def detect_nmap_format(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".xml":
+        return "xml"
+    if suffix == ".gnmap":
+        return "gnmap"
+    if suffix == ".nmap":
+        return "nmap"
+    raise ValueError("Supported Nmap files are .xml, .gnmap, and .nmap")
+
+
+def parse_existing_nmap(path: Path, family: int, dns_server: str | None = None) -> list[dict[str, Any]]:
+    """Normalize existing Nmap output into open host/service records."""
+    fmt = detect_nmap_format(path)
+    records: list[dict[str, Any]] = []
+
+    if fmt == "xml":
+        root = ET.parse(path).getroot()
+        addr_type = "ipv4" if family == 4 else "ipv6"
+
+        for host in root.findall("host"):
+            address_node = next(
+                (x for x in host.findall("address") if x.get("addrtype") == addr_type),
+                None,
+            )
+            if address_node is None:
+                continue
+
+            address = address_node.get("addr", "")
+            hostname_node = host.find("./hostnames/hostname")
+            hostname = hostname_node.get("name", "") if hostname_node is not None else ""
+
+            ports: list[dict[str, Any]] = []
+            for port in host.findall("./ports/port"):
+                state_node = port.find("state")
+                if state_node is None or state_node.get("state") != "open":
+                    continue
+
+                service_node = port.find("service")
+                ports.append({
+                    "protocol": port.get("protocol", ""),
+                    "port": int(port.get("portid", "0")),
+                    "service": service_node.get("name", "") if service_node is not None else "",
+                    "product": service_node.get("product", "") if service_node is not None else "",
+                    "version": service_node.get("version", "") if service_node is not None else "",
+                    "tunnel": service_node.get("tunnel", "") if service_node is not None else "",
+                })
+
+            if ports:
+                records.append({"address": address, "hostname": hostname, "ports": ports})
+
+        return records
+
+    raw = path.read_text(encoding="utf-8", errors="replace")
+
+    if fmt == "gnmap":
+        for line in raw.splitlines():
+            if not line.startswith("Host:") or "Ports:" not in line:
+                continue
+
+            match = re.match(r"Host:\s+(\S+)\s+\((.*?)\)\s+Ports:\s+(.*)", line)
+            if not match:
+                continue
+
+            address, hostname, port_blob = match.groups()
+
+            try:
+                if ipaddress.ip_address(address).version != family:
+                    continue
+            except ValueError:
+                continue
+
+            ports = []
+            for entry in port_blob.split(","):
+                fields = entry.strip().split("/")
+                if len(fields) < 5 or fields[1] != "open":
+                    continue
+
+                try:
+                    number = int(fields[0])
+                except ValueError:
+                    continue
+
+                ports.append({
+                    "protocol": fields[2],
+                    "port": number,
+                    "service": fields[4],
+                    "product": "",
+                    "version": "",
+                    "tunnel": "",
+                })
+
+            if ports:
+                records.append({"address": address, "hostname": hostname, "ports": ports})
+
+        return records
+
+    current_address = ""
+    current_hostname = ""
+    current_ports: list[dict[str, Any]] = []
+
+    def flush() -> None:
+        nonlocal current_address, current_hostname, current_ports
+        if current_address and current_ports:
+            records.append({
+                "address": current_address,
+                "hostname": current_hostname,
+                "ports": current_ports[:],
+            })
+        current_address = ""
+        current_hostname = ""
+        current_ports = []
+
+    for line in raw.splitlines():
+        if line.startswith("Nmap scan report for "):
+            flush()
+            target = line[len("Nmap scan report for "):].strip()
+            match = re.match(r"(.+?)\s+\(([^)]+)\)$", target)
+
+            if match:
+                current_hostname, current_address = match.group(1), match.group(2)
+            else:
+                try:
+                    ipaddress.ip_address(target)
+                    current_address = target
+                except ValueError:
+                    current_hostname = target
+                    resolved = resolve_hostname(target, family, dns_server)
+                    current_address = sorted(resolved)[0] if resolved else ""
+            continue
+
+        port_match = re.match(
+            r"^(\d+)/(tcp|udp)\s+open\s+(\S+)(?:\s+(.*))?$",
+            line.strip(),
+        )
+
+        if port_match and current_address:
+            number, protocol, service, extra = port_match.groups()
+            current_ports.append({
+                "protocol": protocol,
+                "port": int(number),
+                "service": service,
+                "product": extra or "",
+                "version": "",
+                "tunnel": "",
+            })
+
+    flush()
+    return records
+
+
+def populate_imported_inventory(
+    context: FamilyContext,
+    records: list[dict[str, Any]],
+    source_files: list[Path],
+) -> tuple[int, int, int]:
+    if context.db_path.exists():
+        context.db_path.unlink()
+
+    db = sqlite3.connect(context.db_path)
+    initialize_db(db)
+    cur = db.cursor()
+
+    cur.execute(
+        "INSERT INTO scans(started_at,xml_path,command_json) VALUES(?,?,?)",
+        (
+            datetime.now(timezone.utc).isoformat(),
+            ",".join(str(path) for path in source_files),
+            json.dumps(["import", *map(str, source_files)]),
+        ),
+    )
+
+    scan_id = int(cur.lastrowid)
+    host_count = 0
+    port_count = 0
+
+    for record in records:
+        address = record["address"]
+        hostname = record.get("hostname", "")
+
+        cur.execute(
+            "INSERT INTO hosts(scan_id,address,hostname,status) VALUES(?,?,?,?)",
+            (scan_id, address, hostname, "up"),
+        )
+        host_id = int(cur.lastrowid)
+        host_count += 1
+
+        if hostname:
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO resolutions(
+                    scan_id,hostname,address,source
+                ) VALUES(?,?,?,?)
+                """,
+                (
+                    scan_id,
+                    hostname.rstrip(".").lower(),
+                    address,
+                    "imported-nmap",
+                ),
+            )
+
+        for port in record["ports"]:
+            cur.execute(
+                """
+                INSERT INTO ports(
+                    host_id,protocol,port,state,service,product,version,tunnel
+                ) VALUES(?,?,?,?,?,?,?,?)
+                """,
+                (
+                    host_id,
+                    port["protocol"],
+                    port["port"],
+                    "open",
+                    port.get("service", ""),
+                    port.get("product", ""),
+                    port.get("version", ""),
+                    port.get("tunnel", ""),
+                ),
+            )
+            port_count += 1
+
+    db.commit()
+    db.close()
+    context.scan_id = scan_id
+
+    return scan_id, host_count, port_count
+
+
+
+def preferred_live_identity(
+    context: FamilyContext,
+    address: str,
+) -> str:
+    """
+    Prefer a verified FQDN for live-hosts.txt, then a bare computer name,
+    then the IP address.
+
+    Core/resolve.py already tries parent domains observed elsewhere in the
+    engagement for bare computer names and only accepts the inferred FQDN
+    when forward DNS resolves back to the same IP.
+    """
+    with sqlite3.connect(context.db_path) as db:
+        db.row_factory = sqlite3.Row
+        rows = db.execute(
+            """
+            SELECT hostname, source
+            FROM resolutions
+            WHERE scan_id = ?
+              AND address = ?
+              AND hostname IS NOT NULL
+              AND hostname != ''
+            ORDER BY
+              CASE source
+                WHEN 'forward-target' THEN 0
+                WHEN 'core-resolve' THEN 1
+                WHEN 'imported-nmap' THEN 2
+                WHEN 'nmap-xml' THEN 3
+                WHEN 'reverse-ptr' THEN 4
+                WHEN 'reverse-ptr-supplemental' THEN 5
+                ELSE 6
+              END,
+              hostname
+            """,
+            (context.scan_id, address),
+        ).fetchall()
+
+    names = []
+    seen = set()
+
+    for row in rows:
+        name = (row["hostname"] or "").strip().rstrip(".").lower()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+
+    if not names:
+        return address
+
+    fqdns = [name for name in names if "." in name]
+    if fqdns:
+        return fqdns[0]
+
+    return names[0]
+
+
+
+def write_etc_hosts_ready(context: FamilyContext) -> int:
+    """
+    Generate an /etc/hosts-ready file using only FQDNs that resolve back to
+    the associated IP. Bare names and unresolved IPs are excluded.
+    """
+    with sqlite3.connect(context.db_path) as db:
+        db.row_factory = sqlite3.Row
+        rows = db.execute(
+            """
+            SELECT address, hostname
+            FROM resolutions
+            WHERE scan_id = ?
+              AND hostname IS NOT NULL
+              AND hostname != ''
+            ORDER BY address, hostname
+            """,
+            (context.scan_id,),
+        ).fetchall()
+
+    family = socket.AF_INET if context.family == 4 else socket.AF_INET6
+    by_address: dict[str, list[str]] = {}
+
+    for row in rows:
+        address = (row["address"] or "").strip()
+        hostname = (row["hostname"] or "").strip().rstrip(".").lower()
+
+        if not address or "." not in hostname:
+            continue
+
+        try:
+            infos = socket.getaddrinfo(
+                hostname,
+                None,
+                family,
+                socket.SOCK_STREAM,
+            )
+            resolved = {
+                info[4][0].split("%", 1)[0]
+                for info in infos
+                if info and info[4]
+            }
+        except OSError:
+            continue
+
+        if address in resolved:
+            by_address.setdefault(address, []).append(hostname)
+
+    pairs: list[tuple[str, str]] = []
+
+    for address in sorted(by_address, key=ipaddress.ip_address):
+        # One clean verified FQDN per IP.
+        hostname = sorted(
+            set(by_address[address]),
+            key=lambda value: (value.count("."), len(value), value),
+        )[0]
+        pairs.append((address, hostname))
+
+    path = context.db_root / "etc-hosts.txt"
+
+    if not pairs:
+        if path.exists():
+            path.unlink()
+        return 0
+
+    path.write_text(
+        "".join(
+            f"{address}\\t{hostname}\\n"
+            for address, hostname in pairs
+        ),
+        encoding="utf-8",
+    )
+
+    return len(pairs)
+
+
+def write_normalized_inventory(context: FamilyContext) -> dict[str, Any]:
+    """
+    Write standard inventory files.
+
+    ports-per-host.txt:
+        host-or-ip:port<TAB>protocol<TAB>service
+    """
+    with sqlite3.connect(context.db_path) as db:
+        db.row_factory = sqlite3.Row
+        rows = db.execute(
+            """
+            SELECT h.address,h.hostname,p.protocol,p.port,p.service
+            FROM hosts h
+            JOIN ports p ON p.host_id=h.id
+            WHERE h.scan_id=? AND p.state='open'
+            ORDER BY h.address,p.protocol,p.port
+            """,
+            (context.scan_id,),
+        ).fetchall()
+
+    if not rows:
+        return {}
+
+    output = context.db_root
+    output.mkdir(parents=True, exist_ok=True)
+
+    per_host: list[str] = []
+    live_hosts: set[str] = set()
+    tcp_ports: set[int] = set()
+    udp_ports: set[int] = set()
+    service_frequency: dict[str, int] = {}
+
+    for row in rows:
+        host = row["hostname"] or row["address"]
+        protocol = row["protocol"]
+        port = int(row["port"])
+        service = row["service"] or "unknown"
+
+        per_host.append(f"{host}:{port}\t{protocol}\t{service}")
+        live_hosts.add(row["address"])
+        service_frequency[service] = service_frequency.get(service, 0) + 1
+
+        if protocol == "tcp":
+            tcp_ports.add(port)
+        elif protocol == "udp":
+            udp_ports.add(port)
+
+    (output / "ports-per-host.txt").write_text(
+        "\n".join(per_host) + "\n",
+        encoding="utf-8",
+    )
+
+    sorted_live_addresses = sorted(
+        live_hosts,
+        key=ipaddress.ip_address,
+    )
+
+    preferred_live_hosts = [
+        preferred_live_identity(
+            context,
+            address,
+        )
+        for address in sorted_live_addresses
+    ]
+
+    (output / "live-hosts.txt").write_text(
+        "\n".join(preferred_live_hosts) + "\n",
+        encoding="utf-8",
+    )
+
+    context.hosts_path.write_text(
+        "\n".join(sorted_live_addresses) + "\n",
+        encoding="utf-8",
+    )
+
+    (output / "service-frequency.txt").write_text(
+        "\n".join(
+            f"{count:6d} {service}"
+            for service, count in sorted(
+                service_frequency.items(),
+                key=lambda item: (-item[1], item[0]),
+            )
+        ) + "\n",
+        encoding="utf-8",
+    )
+
+    (output / "tcp-ports.txt").write_text(
+        ("T:" + ",".join(map(str, sorted(tcp_ports))) + "\n")
+        if tcp_ports else "",
+        encoding="utf-8",
+    )
+
+    (output / "udp-ports.txt").write_text(
+        ("U:" + ",".join(map(str, sorted(udp_ports))) + "\n")
+        if udp_ports else "",
+        encoding="utf-8",
+    )
+
+    context.flat_db_path.write_text(
+        "".join(
+            f"{row['hostname'] or row['address']}, {row['port']}\n"
+            for row in rows
+        ),
+        encoding="utf-8",
+    )
+
+    etc_hosts_count = write_etc_hosts_ready(context)
+
+    if etc_hosts_count:
+        etc_hosts_path = context.db_root / "etc-hosts.txt"
+        print(
+            f"[*] {context.label}: {etc_hosts_count} verified FQDN/IP "
+            "mapping(s) available for /etc/hosts."
+        )
+        print(f"[*] /etc/hosts-ready file: {etc_hosts_path}")
+        print(
+            "[i] Optional command: "
+            f"sudo sh -c 'cat \"{etc_hosts_path}\" >> /etc/hosts'"
+        )
+
+    return {
+        "live_hosts": len(live_hosts),
+        "tcp_unique_ports": len(tcp_ports),
+        "udp_unique_ports": len(udp_ports),
+        "open_services": len(rows),
+    }
+
+
+def prompt_existing_scan_files() -> list[Path]:
+    print("\nExisting Nmap scan import")
+    print("-------------------------")
+    print("Supported formats: .xml, .gnmap, .nmap")
+    print("Multiple files may be comma-separated.")
+
+    while True:
+        raw = input("Nmap output file(s): ").strip()
+
+        files = [
+            Path(value.strip()).expanduser().resolve()
+            for value in raw.split(",")
+            if value.strip()
+        ]
+
+        if not files:
+            print("[!] At least one file is required.")
+            continue
+
+        missing = [str(path) for path in files if not path.is_file()]
+
+        if missing:
+            print("[!] File(s) not found: " + ", ".join(missing))
+            continue
+
+        try:
+            for path in files:
+                detect_nmap_format(path)
+        except ValueError as exc:
+            print(f"[!] {exc}")
+            continue
+
+        return files
 
 
 def initialize_db(db: sqlite3.Connection) -> None:
@@ -733,11 +1470,73 @@ def discover_modules() -> list[tuple[str, Any]]:
     return modules
 
 
-def run_modules(nmap: str, contexts: list[FamilyContext], assessment: dict[str, Any]) -> None:
-    modules = discover_modules()
-    assessment["modules"] = {}
-    for name, module in modules:
-        record = {"started": datetime.now(timezone.utc).isoformat(), "families": {}, "status": "running"}
+def parse_module_selection(
+    value: str,
+    modules: list[tuple[str, Any]],
+) -> list[tuple[str, Any]]:
+    lookup = {name.lower(): (name, module) for name, module in modules}
+    clean = value.strip()
+    if clean.upper() == "ALL":
+        return modules
+    if clean.upper() in {"NONE", "N", "NO", "Q", "QUIT", ""}:
+        return []
+
+    selected: list[tuple[str, Any]] = []
+    seen: set[str] = set()
+    for token in (part.strip() for part in clean.split(",")):
+        if not token:
+            continue
+        item: tuple[str, Any] | None = None
+        if token.isdigit():
+            index = int(token) - 1
+            if 0 <= index < len(modules):
+                item = modules[index]
+        else:
+            item = lookup.get(token.lower())
+        if item is None:
+            raise ValueError(f"Unknown module selection: {token}")
+        if item[0] not in seen:
+            seen.add(item[0])
+            selected.append(item)
+    return selected
+
+
+def prompt_module_selection(
+    modules: list[tuple[str, Any]],
+    already_run: set[str],
+) -> list[tuple[str, Any]]:
+    print("\\nAvailable configuration-audit modules")
+    print("-------------------------------------")
+    for index, (name, _module) in enumerate(modules, 1):
+        status = " (already run)" if name in already_run else ""
+        print(f"{index}) {name}{status}")
+    print("ALL) Run all modules")
+    print("NONE) Exit module selection")
+    while True:
+        value = input(
+            "Select modules by number or name (comma-separated), ALL, or NONE: "
+        ).strip()
+        try:
+            return parse_module_selection(value, modules)
+        except ValueError as exc:
+            print(f"[!] {exc}")
+
+
+def execute_module_batch(
+    nmap: str,
+    contexts: list[FamilyContext],
+    assessment: dict[str, Any],
+    selected: list[tuple[str, Any]],
+) -> set[str]:
+    assessment.setdefault("modules", {})
+    completed_names: set[str] = set()
+
+    for name, module in selected:
+        record = {
+            "started": datetime.now(timezone.utc).isoformat(),
+            "families": {},
+            "status": "running",
+        }
         assessment["modules"][name] = record
         total = 0
         try:
@@ -750,7 +1549,7 @@ def run_modules(nmap: str, contexts: list[FamilyContext], assessment: dict[str, 
                     family_label=family.label,
                     db_path=family.db_path,
                     flat_db_path=family.flat_db_path,
-                    findings_dir=family.scan_root.parent / "Findings",
+                    findings_dir=family.db_root.parent.parent / "Findings",
                     scans_dir=family.scan_root,
                     scan_id=family.scan_id,
                     nmap_path=nmap,
@@ -760,15 +1559,114 @@ def run_modules(nmap: str, contexts: list[FamilyContext], assessment: dict[str, 
                 total += count
             record["status"] = "completed"
             record["findings"] = total
+            completed_names.add(name)
+        except KeyboardInterrupt as exc:
+            record["status"] = "interrupted"
+            record["completed"] = datetime.now(timezone.utc).isoformat()
+            raise GracefulInterrupt from exc
         except Exception as exc:
             record["status"] = "failed"
             record["error"] = str(exc)
             print(f"[!] Module {name} failed: {exc}", file=sys.stderr)
         record["completed"] = datetime.now(timezone.utc).isoformat()
+    return completed_names
 
+
+def run_module_menu(
+    nmap: str,
+    contexts: list[FamilyContext],
+    assessment: dict[str, Any],
+    initial_selection: str | None = None,
+    non_interactive: bool = False,
+) -> None:
+    modules = discover_modules()
+    if not modules:
+        print("[*] No configuration-audit modules are available.")
+        return
+
+    already_run: set[str] = set()
+    first = True
+    while True:
+        if non_interactive:
+            selection_text = initial_selection or "ALL"
+            selected = parse_module_selection(selection_text, modules)
+        elif first and initial_selection:
+            selected = parse_module_selection(initial_selection, modules)
+        else:
+            selected = prompt_module_selection(modules, already_run)
+
+        first = False
+        if not selected:
+            print("[*] No further modules selected.")
+            return
+
+        already_run.update(execute_module_batch(nmap, contexts, assessment, selected))
+
+        if non_interactive:
+            return
+        if not yes_no("Would you like to run another module before exiting gracefully?", False):
+            return
 
 def write_assessment(path: Path, assessment: dict[str, Any]) -> None:
     path.write_text(json.dumps(assessment, indent=2, sort_keys=True), encoding="utf-8")
+
+
+
+def save_command(
+    assessment_root: Path,
+    key: str,
+    command: list[str],
+    command_dir: Path,
+    assessment: dict[str, Any],
+) -> None:
+    command_dir.mkdir(parents=True, exist_ok=True)
+    command_path = command_dir / "command.txt"
+    command_path.write_text(
+        " ".join(shlex.quote(part) for part in command) + "\n",
+        encoding="utf-8",
+    )
+    assessment["commands"][key] = {
+        "file": str(command_path.relative_to(assessment_root)),
+        "argument_count": len(command),
+    }
+
+
+def save_requested_port_scope(
+    assessment_root: Path,
+    plan: PortPlan,
+    assessment: dict[str, Any],
+) -> None:
+    scope_dir = assessment_root / "Requested_Ports"
+    scope_dir.mkdir()
+    port_data: dict[str, Any] = {"description": plan.description}
+
+    if plan.tcp_ports:
+        path = scope_dir / "tcp_ports.txt"
+        path.write_text(",".join(map(str, plan.tcp_ports)) + "\n", encoding="utf-8")
+        port_data["tcp_count"] = len(plan.tcp_ports)
+        port_data["tcp_file"] = str(path.relative_to(assessment_root))
+    if plan.udp_ports:
+        path = scope_dir / "udp_ports.txt"
+        path.write_text(",".join(map(str, plan.udp_ports)) + "\n", encoding="utf-8")
+        port_data["udp_count"] = len(plan.udp_ports)
+        port_data["udp_file"] = str(path.relative_to(assessment_root))
+    assessment["port_plan"] = port_data
+
+
+def update_interrupted_assessment() -> None:
+    if CURRENT_ASSESSMENT_PATH is None or not CURRENT_ASSESSMENT_PATH.exists():
+        return
+    try:
+        data = json.loads(CURRENT_ASSESSMENT_PATH.read_text(encoding="utf-8"))
+        data["status"] = "interrupted"
+        data["end_time"] = datetime.now(timezone.utc).isoformat()
+        data["active_screen_sessions"] = sorted(ACTIVE_SCREEN_SESSIONS)
+        CURRENT_ASSESSMENT_PATH.write_text(
+            json.dumps(data, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
 
 
 def parser() -> argparse.ArgumentParser:
@@ -777,6 +1675,15 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--dns-server")
     p.add_argument("--quick", action="store_true")
     p.add_argument("--host-discovery", action="store_true")
+    p.add_argument(
+        "--import-nmap",
+        action="append",
+        default=[],
+        help=(
+            "Import existing .xml/.gnmap/.nmap instead of running "
+            "host discovery and port scans. May be repeated."
+        ),
+    )
     p.add_argument("--ipv6", action="store_true", help="Also resolve and scan IPv6 targets")
     p.add_argument("--ports")
     p.add_argument("--max-retries")
@@ -785,55 +1692,232 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--mtu")
     p.add_argument("--min-rate")
     p.add_argument("--max-hostgroup")
-    p.add_argument("--ipv4-final-output")
-    p.add_argument("--ipv6-final-output")
+    p.add_argument("--assessment-name", help=argparse.SUPPRESS)
+    p.add_argument(
+        "--output-dir",
+        help="Engagement root directory (default: current working directory).",
+    )
     p.add_argument("--run-modules", action="store_true")
+    p.add_argument(
+        "--modules",
+        help="Comma-separated module names/numbers, ALL, or NONE.",
+    )
     p.add_argument("--non-interactive", action="store_true")
     p.add_argument("--print-command", action="store_true")
     return p
 
 
+
+def check_resolver_dependencies() -> None:
+    status = core_resolve.dependency_status()
+    if not status["host"]:
+        die(
+            "Resolver dependency `host` is missing. Install bind9-dnsutils "
+            "(Debian/Kali/Ubuntu) or bind-utils (RHEL/CentOS)."
+        )
+    if not status["nmblookup"]:
+        print("[i] Optional nmblookup missing; NetBIOS enrichment skipped.", file=sys.stderr)
+    if not status["nxc"]:
+        print("[i] Optional nxc/NetExec missing; SMB banner enrichment skipped.", file=sys.stderr)
+
+
+def run_core_resolution(entries: list[str], dns_server: str | None):
+    concrete = [entry for entry in entries if "/" not in entry]
+    if not concrete:
+        return set()
+    print(f"[*] Resolving {len(concrete)} concrete target(s) before scans/modules...")
+    _rows, mappings = core_resolve.resolve_for_bayabas(
+        concrete,
+        dns_server=dns_server,
+        workers=16,
+    )
+    print(f"[*] Resolution complete: {len(mappings)} hostname/IP mapping(s).")
+    return mappings
+
+
+def merge_resolution_mappings_into_db(context: FamilyContext, mappings):
+    if not mappings or context.scan_id is None:
+        return
+    with sqlite3.connect(context.db_path) as db:
+        for hostname, address, source in sorted(mappings):
+            try:
+                if ipaddress.ip_address(address).version != context.family:
+                    continue
+            except ValueError:
+                continue
+            db.execute(
+                """
+                INSERT OR IGNORE INTO resolutions(
+                    scan_id,hostname,address,source
+                ) VALUES(?,?,?,?)
+                """,
+                (context.scan_id, hostname.rstrip(".").lower(), address, source),
+            )
+        db.commit()
+
+
+def read_db_resolution_mappings(context: FamilyContext):
+    result = set()
+    with sqlite3.connect(context.db_path) as db:
+        db.row_factory = sqlite3.Row
+        for row in db.execute(
+            "SELECT hostname,address,source FROM resolutions WHERE scan_id=?",
+            (context.scan_id,),
+        ):
+            result.add((row["hostname"], row["address"], row["source"]))
+    return result
+
+
 def main() -> int:
+    global CURRENT_ASSESSMENT_PATH
     args = parser().parse_args()
     MODULES_DIR.mkdir(parents=True, exist_ok=True)
     nmap, screen = ensure_dependencies()
 
-    raw = args.targets
-    if not raw and not args.non_interactive:
-        raw = prompt("Target file, comma-separated targets, or one target")
-    if not raw:
-        die("Targets are required.")
-    targets = load_targets(raw)
+    # Select import-vs-scan before requesting any targets.
+    import_files = [
+        Path(value).expanduser().resolve()
+        for value in args.import_nmap
+    ]
 
-    ipv6_enabled = args.ipv6
-    if not args.non_interactive:
-        ipv6_enabled = yes_no("Run IPv6 scans (-6) as well?", False)
+    if not args.non_interactive and not import_files:
+        if yes_no("Do you have an existing completed Nmap scan?", False):
+            import_files = prompt_existing_scan_files()
 
-    ipv4_targets, ipv6_targets, explicit_mappings = split_targets(targets, ipv6_enabled)
-    if not ipv4_targets and not ipv6_targets:
-        die("No targets resolved for the selected address families.")
+    import_mode = bool(import_files)
 
+    check_resolver_dependencies()
+
+    targets: list[str] = []
+    ipv4_targets: list[str] = []
+    ipv6_targets: list[str] = []
+    explicit_mappings: set[tuple[str, str, str, int]] = set()
+    import_resolution_mappings: set[tuple[str, str, str]] = set()
+    ipv6_enabled = False
     dns = args.dns_server
+
     if not dns and not args.non_interactive:
-        dns = prompt("Preferred DNS server (--dns-server)", "8.8.8.8", valid_dns)
+        dns = prompt(
+            "DNS server for target resolution (blank = system resolver)",
+            "",
+        ) or None
+
     if dns and not valid_dns(dns):
         die("Invalid DNS server.")
 
-    host_discovery = args.host_discovery
+    host_discovery = False
+    plan = PortPlan([], False, False, "imported Nmap output")
+    timing: list[str] = []
+
+    if not import_mode:
+        raw = args.targets
+
+        if not raw and not args.non_interactive:
+            raw = prompt(
+                "Target file, comma-separated targets, or one target"
+            )
+
+        if not raw:
+            die("Targets are required when an existing Nmap scan is not imported.")
+
+        targets = load_targets(raw)
+
+        preflight_mappings = run_core_resolution(targets, dns)
+
+        ipv6_enabled = args.ipv6
+        if not args.non_interactive:
+            ipv6_enabled = yes_no("Run IPv6 scans (-6) as well?", False)
+
+        ipv4_targets, ipv6_targets, explicit_mappings = split_targets(
+            targets,
+            ipv6_enabled,
+            dns,
+        )
+
+        explicit_mappings.update(
+            (
+                hostname,
+                address,
+                source,
+                ipaddress.ip_address(address).version,
+            )
+            for hostname, address, source in preflight_mappings
+            if ipaddress.ip_address(address).version in (4, 6)
+        )
+
+        if not ipv4_targets and not ipv6_targets:
+            die("No targets resolved for the selected address families.")
+
+        host_discovery = args.host_discovery
+
+        if not args.non_interactive:
+            host_discovery = yes_no("Run host discovery first?", True)
+
+        plan, timing = collect_scan_options(args)
+
+    output_dir = args.output_dir
+
     if not args.non_interactive:
-        host_discovery = yes_no("Run host discovery first?", True)
-    plan, timing = collect_scan_options(args)
+        output_dir = prompt(
+            "Engagement output directory",
+            output_dir or str(Path.cwd()),
+        )
 
-    assessment_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    SCANS_DIR.mkdir(parents=True, exist_ok=True)
-    assessment_root = SCANS_DIR / assessment_id
-    assessment_root.mkdir(parents=True, exist_ok=False)
+    if not output_dir:
+        die("--output-dir is required in non-interactive mode.")
 
-    # Runtime-only assessment content. These paths do not exist in the repository.
-    (assessment_root / "Host_DB").mkdir()
-    (assessment_root / "Findings").mkdir()
+    assessment_root = Path(output_dir).expanduser().resolve()
+    assessment_root.mkdir(parents=True, exist_ok=True)
 
     assessment_path = assessment_root / "assessment.json"
+    if assessment_path.exists():
+        die(
+            "Engagement directory already contains assessment.json: "
+            f"{assessment_root}"
+        )
+
+    CURRENT_ASSESSMENT_PATH = assessment_path
+
+    # Imported Nmap results define their own targets/address families.
+    imported_family_records: dict[int, list[dict[str, Any]]] = {4: [], 6: []}
+
+    if import_mode:
+        for import_path in import_files:
+            for family in (4, 6):
+                try:
+                    imported_family_records[family].extend(
+                        parse_existing_nmap(import_path, family, dns)
+                    )
+                except Exception as exc:
+                    die(f"Could not import {import_path}: {exc}")
+
+        ipv4_targets = sorted({
+            record["address"]
+            for record in imported_family_records[4]
+        })
+        ipv6_targets = sorted({
+            record["address"]
+            for record in imported_family_records[6]
+        })
+        targets = ipv4_targets + ipv6_targets
+
+        if not targets:
+            die("No hosts with open ports were found in the imported Nmap output.")
+
+        resolution_entries = list(targets)
+        resolution_entries.extend(
+            record.get("hostname", "")
+            for family_records in imported_family_records.values()
+            for record in family_records
+            if record.get("hostname")
+        )
+        resolution_entries = list(dict.fromkeys(x for x in resolution_entries if x))
+        import_resolution_mappings = run_core_resolution(
+            resolution_entries,
+            dns,
+        )
+
+    assessment_id = assessment_root.name
     assessment: dict[str, Any] = {
         "assessment_id": assessment_id,
         "assessment_uuid": str(uuid.uuid4()),
@@ -842,14 +1926,20 @@ def main() -> int:
         "start_time": datetime.now(timezone.utc).isoformat(),
         "status": "running",
         "targets": targets,
+        "output_directory": str(assessment_root),
         "ipv4_enabled": bool(ipv4_targets),
         "ipv6_enabled": bool(ipv6_targets),
         "host_discovery": host_discovery,
-        "port_plan": plan.description,
+        "intake_mode": "import" if import_mode else "scan",
+        "port_plan": {},
         "commands": {},
         "statistics": {},
         "artifacts": {},
     }
+    if import_mode:
+        assessment["port_plan"] = {"description": "imported Nmap output"}
+    else:
+        save_requested_port_scope(assessment_root, plan, assessment)
     write_assessment(assessment_path, assessment)
 
     contexts: list[FamilyContext] = []
@@ -862,13 +1952,105 @@ def main() -> int:
     final_commands: dict[int, list[str]] = {}
     final_inventory: dict[int, tuple[list[int], list[int], list[str]]] = {}
 
+    if import_mode:
+        successful_contexts: list[FamilyContext] = []
+
+        for context in contexts:
+            combined: dict[str, dict[str, Any]] = {}
+
+            for record in imported_family_records[context.family]:
+                address = record["address"]
+
+                if address not in combined:
+                    combined[address] = {
+                        "address": address,
+                        "hostname": record.get("hostname", ""),
+                        "ports": [],
+                    }
+
+                if not combined[address]["hostname"] and record.get("hostname"):
+                    combined[address]["hostname"] = record["hostname"]
+
+                existing = {
+                    (port["protocol"], port["port"])
+                    for port in combined[address]["ports"]
+                }
+
+                for port in record["ports"]:
+                    key = (port["protocol"], port["port"])
+
+                    if key not in existing:
+                        combined[address]["ports"].append(port)
+                        existing.add(key)
+
+            records = list(combined.values())
+
+            if not records:
+                continue
+
+            scan_id, hosts, ports = populate_imported_inventory(
+                context,
+                records,
+                import_files,
+            )
+
+            merge_resolution_mappings_into_db(
+                context,
+                import_resolution_mappings,
+            )
+            write_resolution_files(
+                context,
+                read_db_resolution_mappings(context),
+            )
+            stats = write_normalized_inventory(context)
+            successful_contexts.append(context)
+
+            assessment["statistics"][f"{context.label}_hosts"] = hosts
+            assessment["statistics"][f"{context.label}_port_records"] = ports
+            assessment["statistics"][f"{context.label}_inventory"] = stats
+            assessment["artifacts"][f"{context.label}_database"] = str(context.db_path)
+            assessment["artifacts"][f"{context.label}_ports_per_host"] = str(
+                context.db_root / "ports-per-host.txt"
+            )
+
+        write_assessment(assessment_path, assessment)
+
+        run_selected = args.run_modules or bool(args.modules)
+
+        if not args.non_interactive and not args.modules:
+            run_selected = yes_no("Run configuration-audit modules now?", True)
+
+        if run_selected and successful_contexts:
+            run_module_menu(
+                nmap,
+                successful_contexts,
+                assessment,
+                initial_selection=args.modules,
+                non_interactive=args.non_interactive,
+            )
+
+        assessment["status"] = "completed"
+        assessment["end_time"] = datetime.now(timezone.utc).isoformat()
+        write_assessment(assessment_path, assessment)
+
+        print("\a[*] Bayabas assessment completed from imported Nmap output.")
+        print(f"[*] Metadata: {assessment_path}")
+
+        return 0
+
     for context in contexts:
         write_lines(context.original_targets_file, context.targets)
         initial_targets = context.original_targets_file
 
         if host_discovery:
             command = discovery_command(nmap, context, dns)
-            assessment["commands"][f"{context.label}_discovery"] = command
+            save_command(
+                assessment_root,
+                f"{context.label}_discovery",
+                command,
+                context.discovery_dir,
+                assessment,
+            )
             print("[*] " + " ".join(shlex.quote(x) for x in command))
             if not args.print_command:
                 code = run_one_screen(
@@ -887,7 +2069,13 @@ def main() -> int:
                 initial_targets = context.discovery_targets_file
 
         command = initial_command(nmap, context, initial_targets, plan, timing, dns, host_discovery)
-        assessment["commands"][f"{context.label}_initial"] = command
+        save_command(
+            assessment_root,
+            f"{context.label}_initial",
+            command,
+            context.initial_dir,
+            assessment,
+        )
         print("[*] " + " ".join(shlex.quote(x) for x in command))
         if args.print_command:
             continue
@@ -905,18 +2093,21 @@ def main() -> int:
             continue
         final_inventory[context.family] = (tcp, udp, live)
 
-        option_value = args.ipv4_final_output if context.family == 4 else args.ipv6_final_output
-        if not option_value and not args.non_interactive:
-            option_value = prompt(
-                f"Required {context.label} final Nmap output base (name or full path)",
-                f"{context.label.lower()}_final_scan",
-            )
-        if not option_value:
-            die(f"--{context.label.lower()}-final-output is required.")
-        context.final_output_base = validate_output_base(option_value, context.final_dir)
+        # All scan output names derive from the user-selected assessment directory.
+        # No separate initial/final output prompt is required.
+        context.final_output_base = validate_output_base(
+            "final_scan",
+            context.final_dir,
+        )
         command = final_command(nmap, context, timing, tcp, udp)
         final_commands[context.family] = command
-        assessment["commands"][f"{context.label}_final"] = command
+        save_command(
+            assessment_root,
+            f"{context.label}_final",
+            command,
+            context.final_dir,
+            assessment,
+        )
         final_jobs.append(
             make_job(
                 screen, f"bayabas-{context.label.lower()}-final",
@@ -948,21 +2139,29 @@ def main() -> int:
             print(f"[!] {context.label} final scan failed.", file=sys.stderr)
             continue
         _, _, live = final_inventory[context.family]
-        mappings = collect_family_mappings(context.family, explicit_mappings, live)
+        mappings = collect_family_mappings(context.family, explicit_mappings, live, dns)
         write_resolution_files(context, mappings)
         scan_id, hosts, ports = import_final(context, xml, command, mappings)
+        inventory_stats = write_normalized_inventory(context)
         successful_contexts.append(context)
+        assessment["statistics"][f"{context.label}_inventory"] = inventory_stats
         assessment["statistics"][f"{context.label}_hosts"] = hosts
         assessment["statistics"][f"{context.label}_port_records"] = ports
         assessment["artifacts"][f"{context.label}_final_xml"] = str(xml)
         assessment["artifacts"][f"{context.label}_database"] = str(context.db_path)
         print(f"[*] {context.label}: imported {hosts} hosts and {ports} port records (scan {scan_id}).")
 
-    run_selected = args.run_modules
-    if not args.non_interactive:
+    run_selected = args.run_modules or bool(args.modules)
+    if not args.non_interactive and not args.modules:
         run_selected = yes_no("Run configuration-audit modules now?", True)
     if run_selected and successful_contexts:
-        run_modules(nmap, successful_contexts, assessment)
+        run_module_menu(
+            nmap,
+            successful_contexts,
+            assessment,
+            initial_selection=args.modules,
+            non_interactive=args.non_interactive,
+        )
 
     assessment["status"] = "completed"
     assessment["end_time"] = datetime.now(timezone.utc).isoformat()
@@ -973,4 +2172,17 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except (KeyboardInterrupt, GracefulInterrupt):
+        update_interrupted_assessment()
+        if ACTIVE_SCREEN_SESSIONS:
+            print(
+                "\n[!] Bayabas exited gracefully. Active Screen sessions remain running:",
+                file=sys.stderr,
+            )
+            for session in sorted(ACTIVE_SCREEN_SESSIONS):
+                print(f"    screen -r {session}", file=sys.stderr)
+        else:
+            print("\n[!] Bayabas exited gracefully.", file=sys.stderr)
+        raise SystemExit(130)

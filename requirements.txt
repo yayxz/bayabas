@@ -1,0 +1,34 @@
+# Bayabas - Python dependencies
+#
+#   pip install -r requirements.txt --break-system-packages
+#
+# These are the same packages Modules/cipher.py, Modules/caa.py, and
+# Modules/dnssec.py will each individually offer to install on first run
+# if missing. Installing them all up front via this file just avoids
+# being prompted separately per module.
+#
+# Core bayabas.py, Core/resolve.py, and Modules/ssh.py use only the
+# Python standard library and need nothing from this file.
+
+cryptography   # Modules/cipher.py - TLS certificate parsing
+dnspython      # Modules/caa.py, Modules/dnssec.py - CAA/DNSSEC DNS queries
+
+# --- NOT covered by this file ---
+#
+# The following are required or optional dependencies of Bayabas that
+# are NOT Python packages, so `pip install` cannot provide them:
+#
+#   nmap            required, system package   (apt install nmap)
+#   host             required, system package   (apt install dnsutils)
+#   screen           required, system package   (apt install screen)
+#   nmblookup        optional, system package   (apt install samba-common-bin)
+#   nxc / NetExec    optional, separate tool    (pipx install netexec)
+#
+#   httpx            optional, used by Modules/cipher.py for HTTP(S)
+#                    probing -- this is ProjectDiscovery's Go-based CLI
+#                    tool, NOT the PyPI Python package of the same name.
+#                    Do NOT `pip install httpx` for this -- it will not
+#                    provide the binary cipher.py actually calls. Install
+#                    with: go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+#                    cipher.py will also offer to run this install command
+#                    for you automatically if httpx isn't found.
