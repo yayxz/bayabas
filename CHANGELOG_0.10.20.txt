@@ -1,0 +1,5 @@
+Bayabas 0.10.20
+- Added BAYABAS startup banner.
+- Added Interactive Scan vs User Flags.
+- Interactive Scan supports TCP, UDP, and combined TCP/UDP scopes.
+- User Flags shows sample input and validates common typos, Bayabas-managed flags, protocol mismatches, and -sT/--mtu incompatibility before execution.

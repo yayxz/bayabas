@@ -38,7 +38,7 @@ except ImportError:
     readline = None
 
 APP = "Bayabas"
-VERSION = "0.10.18"
+VERSION = "0.10.20"
 ROOT = Path(__file__).resolve().parent
 MODULES_DIR = ROOT / "Modules"
 
@@ -86,6 +86,7 @@ class PortPlan:
     description: str
     tcp_ports: tuple[int, ...] = ()
     udp_ports: tuple[int, ...] = ()
+    user_flags: tuple[str, ...] = ()
 
 
 @dataclass
@@ -750,51 +751,115 @@ def parse_port_plan(value: str) -> PortPlan:
         tuple(sorted(udp_ports)),
     )
 
+def _interactive_port_plan() -> PortPlan:
+    print("""\n============================================================
+ INTERACTIVE SCAN
+============================================================
+ [1]  TCP Quick (-F)          [6]  UDP Top 100
+ [2]  TCP Top 100             [7]  UDP Top 1000
+ [3]  TCP Top 1000            [8]  UDP All
+ [4]  TCP All (-p-)           [9]  UDP Custom
+ [5]  TCP Custom
+ [10] TCP + UDP Top 100
+ [11] TCP + UDP Top 1000
+ [12] TCP + UDP Custom
+ [13] TCP All + UDP Custom
+ [14] TCP Custom + UDP All
+ [15] TCP All + UDP All
+""")
+    c = prompt("Select", "3")
+    if c=="1": return PortPlan(["-F"], True, False, "TCP quick")
+    if c=="2": return PortPlan(["--top-ports","100"], True, False, "TCP top 100")
+    if c=="3": return PortPlan(["--top-ports","1000"], True, False, "TCP top 1000")
+    if c=="4": return PortPlan(["-p-"], True, False, "TCP all")
+    if c=="5": return parse_port_plan("T:"+prompt("TCP ports","22,80,443"))
+    if c=="6": return PortPlan(["--top-ports","100"], False, True, "UDP top 100")
+    if c=="7": return PortPlan(["--top-ports","1000"], False, True, "UDP top 1000")
+    if c=="8": return PortPlan(["-p","U:1-65535"], False, True, "UDP all")
+    if c=="9": return parse_port_plan("U:"+prompt("UDP ports","53,123,161"))
+    if c in {"10","11"}:
+        n="100" if c=="10" else "1000"
+        return PortPlan(["--top-ports",n], True, True, f"TCP + UDP top {n}")
+    if c=="12": return parse_port_plan("T:"+prompt("TCP ports","22,80,443")+",U:"+prompt("UDP ports","53,123,161"))
+    if c=="13": return PortPlan(["-p","T:1-65535,U:"+prompt("UDP ports","53,123,161")], True, True, "TCP all + UDP custom")
+    if c=="14": return PortPlan(["-p","T:"+prompt("TCP ports","22,80,443")+",U:1-65535"], True, True, "TCP custom + UDP all")
+    if c=="15": return PortPlan(["-p","T:1-65535,U:1-65535"], True, True, "TCP all + UDP all")
+    die("Invalid Interactive Scan selection.")
+
+_USER_FLAG_VALUE_OPTS={"-p","--top-ports","--max-retries","--max-scan-delay","--min-parallelism","--min-rate","--max-rate","--min-hostgroup","--max-hostgroup","--mtu","--host-timeout","--scan-delay","--version-intensity"}
+_USER_FLAG_NO_VALUE={"-sS","-sT","-sU","-Pn","-n","-v","-vv","--open","--reason","-F","-T0","-T1","-T2","-T3","-T4","-T5","-p-"}
+_BAYABAS_MANAGED={"-iL","-oA","-oN","-oX","-oG"}
+_COMMON_FLAG_TYPOS={"--opne":"--open","--reson":"--reason","--reasn":"--reason","--max-retrys":"--max-retries","--min-paralellism":"--min-parallelism"}
+
+def _validate_user_flags(raw: str) -> PortPlan:
+    tokens=shlex.split(raw)
+    if not tokens: raise ValueError("No Nmap flags supplied.")
+    if tokens[0].lower().endswith("nmap"): raise ValueError("Enter flags only; do not include `nmap`.")
+    clean=[]; tcp=False; udp=False; port_expr=None; i=0
+    while i<len(tokens):
+        t=tokens[i]
+        if t in _BAYABAS_MANAGED: raise ValueError(f"{t} is Bayabas-managed.")
+        if t in _COMMON_FLAG_TYPOS: raise ValueError(f"Unknown option {t}. Did you mean {_COMMON_FLAG_TYPOS[t]}?")
+        if not t.startswith("-"): raise ValueError(f"Unexpected target/value `{t}`; Bayabas manages targets.")
+        if t in {"-sS","-sT"}: tcp=True
+        if t=="-sU": udp=True
+        if t in _USER_FLAG_VALUE_OPTS:
+            if i+1>=len(tokens): raise ValueError(f"{t} requires a value.")
+            v=tokens[i+1]
+            if t=="-p": port_expr=v
+            clean.extend([t,v]); i+=2; continue
+        if t not in _USER_FLAG_NO_VALUE: raise ValueError(f"Unknown/unsupported User Flag `{t}`.")
+        if t not in clean: clean.append(t)
+        i+=1
+    if "-sT" in clean and "--mtu" in clean: raise ValueError("Flag mismatch: --mtu is incompatible with -sT.")
+    if "-sS" in clean and "-sT" in clean: raise ValueError("Flag mismatch: choose -sS or -sT, not both.")
+    if port_expr:
+        up=port_expr.upper()
+        if "U:" in up and not udp: raise ValueError("Protocol mismatch: UDP ports supplied but -sU is missing.")
+        if "T:" in up and not tcp: raise ValueError("Protocol mismatch: TCP ports supplied but -sS/-sT is missing.")
+    if not tcp and not udp:
+        tcp=True; clean.insert(0,"-sS")
+    return PortPlan([],tcp,udp,"User Flags",user_flags=tuple(clean))
+
 def collect_scan_options(args: argparse.Namespace) -> tuple[PortPlan, list[str]]:
-    quick = args.quick if args.non_interactive else yes_no("Use quick scan (-F)?", False)
-    if quick:
-        plan = PortPlan(["-F"], True, False, "Nmap fast scan (-F)")
+    if args.non_interactive:
+        plan=PortPlan(["-F"],True,False,"Nmap fast scan (-F)") if args.quick else parse_port_plan(args.ports or "top1000")
     else:
-        raw = args.ports
-        if not raw and not args.non_interactive:
-            raw = prompt("Ports (T:22,80,U:53 | - | top100 | top1000)", "top1000")
-        if not raw:
-            die("--ports is required unless --quick is used.")
-        try:
-            plan = parse_port_plan(raw)
-        except ValueError as exc:
-            die(str(exc))
+        print("""\n============================================================
+ SCAN CONFIGURATION
+============================================================
+ [1] Interactive Scan
+ [2] User Flags
+""")
+        mode=prompt("Select","1")
+        if mode=="2":
+            print("""\n============================================================
+ USER FLAGS
+============================================================
+Enter Nmap flags only. Bayabas manages targets and output paths.
+Examples:
+ TCP:       -sS -Pn -v --open --reason -p 22,80,443
+ UDP:       -sU -Pn --open --reason -p 53,123,161
+ TCP + UDP: -sS -sU -Pn --open --reason -p T:22,80,443,U:53,123,161
+ Full TCP:  -sS -Pn -p- --max-retries 1 --min-rate 500
+""")
+            while True:
+                try:
+                    plan=_validate_user_flags(prompt("User flags","-sS -Pn -v --open --reason -p 80,443"))
+                    print("[+] User Flags validation: PASS")
+                    return plan,[]
+                except ValueError as exc:
+                    print(f"[!] {exc}",file=sys.stderr)
+                    if not yes_no("Edit User Flags and retry?",True): die("User Flags validation failed.")
+        if mode!="1": die("Invalid scan configuration mode.")
+        plan=_interactive_port_plan()
 
-    values = {
-        "max_retries": args.max_retries,
-        "max_scan_delay": args.max_scan_delay,
-        "min_parallelism": args.min_parallelism,
-        "mtu": args.mtu,
-        "min_rate": args.min_rate,
-        "max_hostgroup": args.max_hostgroup,
-    }
-    defaults = {
-        "max_retries": ("2", nonnegative_int),
-        "max_scan_delay": ("1s", valid_time),
-        "min_parallelism": ("10", positive_int),
-        "mtu": ("24", valid_mtu),
-        "min_rate": ("100", valid_rate),
-        "max_hostgroup": ("64", positive_int),
-    }
-    for key, (default, validator) in defaults.items():
-        if not values[key] and not args.non_interactive:
-            values[key] = prompt(key.replace("_", "-"), default, validator)
-        if values[key] is None or not validator(str(values[key])):
-            die(f"Missing or invalid --{key.replace('_', '-')}.")
-    return plan, [
-        "--max-retries", str(values["max_retries"]),
-        "--max-scan-delay", str(values["max_scan_delay"]),
-        "--min-parallelism", str(values["min_parallelism"]),
-        "--mtu", str(values["mtu"]),
-        "--min-rate", str(values["min_rate"]),
-        "--max-hostgroup", str(values["max_hostgroup"]),
-    ]
-
+    vals={"max_retries":args.max_retries,"max_scan_delay":args.max_scan_delay,"min_parallelism":args.min_parallelism,"mtu":args.mtu,"min_rate":args.min_rate,"max_hostgroup":args.max_hostgroup}
+    defs={"max_retries":("2",nonnegative_int),"max_scan_delay":("1s",valid_time),"min_parallelism":("10",positive_int),"mtu":("24",valid_mtu),"min_rate":("100",valid_rate),"max_hostgroup":("64",positive_int)}
+    for k,(d,v) in defs.items():
+        if not vals[k] and not args.non_interactive: vals[k]=prompt(k.replace("_","-"),d,v)
+        if vals[k] is None or not v(str(vals[k])): die(f"Missing or invalid --{k.replace('_','-')}.")
+    return plan,["--max-retries",str(vals["max_retries"]),"--max-scan-delay",str(vals["max_scan_delay"]),"--min-parallelism",str(vals["min_parallelism"]),"--mtu",str(vals["mtu"]),"--min-rate",str(vals["min_rate"]),"--max-hostgroup",str(vals["max_hostgroup"])]
 
 def make_family_context(assessment_root: Path, family: int, targets: list[str]) -> FamilyContext:
     label = f"IPv{family}"
@@ -890,10 +955,19 @@ def initial_command(
     dns: str | None,
     discovery_done: bool,
 ) -> list[str]:
-    command = [nmap, *nmap_family_arg(context.family), "--open", "--reason", "-n", "-v", "-iL", str(target_file)]
-    if discovery_done:
-        command.append("-Pn")
-    command += scan_modes(plan) + plan.args + timing
+    command = [nmap, *nmap_family_arg(context.family), "-iL", str(target_file)]
+    if plan.user_flags:
+        command += list(plan.user_flags)
+        for flag in ("--open", "--reason", "-n"):
+            if flag not in command:
+                command.append(flag)
+        if discovery_done and "-Pn" not in command:
+            command.append("-Pn")
+    else:
+        command += ["--open", "--reason", "-n", "-v"]
+        if discovery_done:
+            command.append("-Pn")
+        command += scan_modes(plan) + plan.args + timing
     if dns:
         command += ["--dns-servers", dns]
     command += ["-oA", str(context.initial_dir / "initial_scan")]
@@ -2055,6 +2129,12 @@ def read_db_resolution_mappings(context: FamilyContext):
 def main() -> int:
     global CURRENT_ASSESSMENT_PATH
     args = parser().parse_args()
+    print("=" * 60)
+    print("                         BAYABAS")
+    print('                  "Mahuhulog ka rin !!!"')
+    print(f"                       v{VERSION}")
+    print("=" * 60)
+    print()
     MODULES_DIR.mkdir(parents=True, exist_ok=True)
     nmap = ensure_dependencies()
 
