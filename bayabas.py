@@ -38,7 +38,7 @@ except ImportError:
     readline = None
 
 APP = "Bayabas"
-VERSION = "0.10.17"
+VERSION = "0.10.18"
 ROOT = Path(__file__).resolve().parent
 MODULES_DIR = ROOT / "Modules"
 
@@ -47,6 +47,26 @@ HOSTNAME_RE = re.compile(
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?$"
 )
 TIME_RE = re.compile(r"^\d+(?:ms|s|m|h)?$", re.I)
+
+# Shared/multi-tenant provider namespaces must never become passive-enumeration
+# roots merely because an explicit client resource lives beneath them.
+SHARED_PROVIDER_SUFFIXES: dict[str, tuple[str, str]] = {
+    "s3.amazonaws.com": ("AWS", "S3"),
+    "amazonaws.com": ("AWS", "Shared AWS service"),
+    "cloudfront.net": ("AWS", "CloudFront"),
+    "azurewebsites.net": ("Microsoft Azure", "App Service"),
+    "blob.core.windows.net": ("Microsoft Azure", "Blob Storage"),
+    "trafficmanager.net": ("Microsoft Azure", "Traffic Manager"),
+    "azureedge.net": ("Microsoft Azure", "CDN"),
+    "azurefd.net": ("Microsoft Azure", "Front Door"),
+    "appspot.com": ("Google Cloud", "App Engine"),
+    "storage.googleapis.com": ("Google Cloud", "Cloud Storage"),
+    "run.app": ("Google Cloud", "Cloud Run"),
+    "github.io": ("GitHub", "GitHub Pages"),
+    "herokuapp.com": ("Heroku", "Heroku App"),
+    "netlify.app": ("Netlify", "Netlify App"),
+    "vercel.app": ("Vercel", "Vercel App"),
+}
 
 
 CURRENT_ASSESSMENT_PATH: Path | None = None
@@ -382,6 +402,44 @@ def normalize_client_domains(values: list[str]) -> list[str]:
             if domain and HOSTNAME_RE.fullmatch(domain) and domain not in result:
                 result.append(domain)
     return result
+
+
+def classify_shared_provider_hostname(hostname: str) -> tuple[str, str, str] | None:
+    host = hostname.lower().rstrip(".")
+    # Longest suffix wins, so S3 gets a service-specific classification before
+    # the broader amazonaws.com fallback.
+    for suffix in sorted(SHARED_PROVIDER_SUFFIXES, key=len, reverse=True):
+        if host == suffix or host.endswith("." + suffix):
+            provider, service = SHARED_PROVIDER_SUFFIXES[suffix]
+            return provider, service, suffix
+    return None
+
+
+def target_hostnames(targets: list[str]) -> list[str]:
+    hosts: list[str] = []
+    for target in targets:
+        try:
+            ipaddress.ip_network(target, strict=False)
+            continue
+        except ValueError:
+            pass
+        host = target.lower().rstrip(".")
+        if HOSTNAME_RE.fullmatch(host):
+            hosts.append(host)
+    return list(dict.fromkeys(hosts))
+
+
+def passive_enumeration_domains(domains: list[str]) -> tuple[list[str], list[tuple[str, str, str, str]]]:
+    allowed: list[str] = []
+    skipped: list[tuple[str, str, str, str]] = []
+    for domain in domains:
+        provider = classify_shared_provider_hostname(domain)
+        if provider:
+            provider_name, service, suffix = provider
+            skipped.append((domain, provider_name, service, suffix))
+        else:
+            allowed.append(domain)
+    return allowed, skipped
 
 
 def external_passive_tool_status() -> dict[str, str | None]:
@@ -2059,9 +2117,17 @@ def main() -> int:
             if not yes_no(f"Use {assessment_type.upper()} workflow?", True):
                 assessment_type = "internal" if assessment_type == "external" else "external"
         client_domains = normalize_client_domains(args.client_domain)
+        supplied_hosts = target_hostnames(targets)
+        all_hosts_are_shared_provider = bool(supplied_hosts) and all(
+            classify_shared_provider_hostname(host) is not None for host in supplied_hosts
+        )
         if not args.non_interactive and not client_domains:
-            entered = prompt("Client domain(s) for authorized DNS enumeration (comma-separated, blank = skip)", "")
-            client_domains = normalize_client_domains([entered]) if entered else []
+            if assessment_type == "external" and all_hosts_are_shared_provider:
+                print("[*] All supplied hostname targets are recognized shared cloud-provider resources.")
+                print("[*] Client-domain passive enumeration prompt skipped; exact targets will still receive DNS resolution/enrichment.")
+            else:
+                entered = prompt("Client domain(s) for authorized DNS enumeration (comma-separated, blank = skip)", "")
+                client_domains = normalize_client_domains([entered]) if entered else []
         print(f"[*] Assessment workflow: {assessment_type.upper()}")
         if client_domains:
             print("[*] Authorized client domain(s): " + ", ".join(client_domains))
@@ -2285,7 +2351,23 @@ def main() -> int:
     database_root = assessment_root / "Database"
     database_root.mkdir(parents=True, exist_ok=True)
     if assessment_type == "external" and client_domains:
-        passive_names = passive_subdomain_enumeration(client_domains, database_root)
+        passive_domains, skipped_provider_domains = passive_enumeration_domains(client_domains)
+        if skipped_provider_domains:
+            print("[*] Passive external enumeration decision:")
+            for domain, provider, service, suffix in skipped_provider_domains:
+                print(f"    [SKIP] {domain} -> {provider} / {service} (shared namespace: {suffix})")
+            print("[*] Shared-provider namespaces remain DNS-enrichment targets only; passive subdomain tools will not run against them.")
+        if passive_domains:
+            passive_names = passive_subdomain_enumeration(passive_domains, database_root)
+        else:
+            # Still show installed/missing passive capabilities for auditability,
+            # without invoking any enumerator against a provider namespace.
+            status = external_passive_tool_status()
+            print("[*] Passive external enumeration capability check:")
+            for name, path in status.items():
+                print(f"    {'[+]' if path else '[-]'} {name:<12} {'FOUND' if path else 'MISSING'}")
+            print("[*] Passive enumeration execution: SKIPPED (no client-controlled enumeration root).")
+            passive_names = set()
         if passive_names:
             passive_mappings = run_core_resolution(sorted(passive_names), dns)
             explicit_mappings.update((h, a, src, ipaddress.ip_address(a).version) for h, a, src in passive_mappings)

@@ -1,0 +1,8 @@
+Bayabas 0.10.18
+
+- Shared cloud/multi-tenant provider namespaces are excluded from passive subdomain enumeration.
+- Exact cloud-provider hostnames remain eligible for DNS A/AAAA/CNAME resolution and enrichment.
+- If all supplied external hostname targets are recognized shared-provider resources, Bayabas skips the client-domain enumeration prompt.
+- Passive tool capability status is still displayed when enumeration execution is skipped.
+- Mixed scopes enumerate only client-controlled roots; provider roots are recorded/skipped individually.
+- Added common AWS, Azure, Google Cloud, GitHub Pages, Heroku, Netlify, and Vercel shared namespace classifications.
