@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import glob
 import importlib.util
 import ipaddress
 import json
@@ -31,8 +32,13 @@ from urllib.parse import urlsplit
 from Core import resolve as core_resolve
 from typing import Any, Iterable
 
+try:
+    import readline
+except ImportError:
+    readline = None
+
 APP = "Bayabas"
-VERSION = "0.10.16"
+VERSION = "0.10.17"
 ROOT = Path(__file__).resolve().parent
 MODULES_DIR = ROOT / "Modules"
 
@@ -112,6 +118,41 @@ class ModuleContext:
 def die(message: str, code: int = 1) -> None:
     print(f"[!] {message}", file=sys.stderr)
     raise SystemExit(code)
+
+
+def _filesystem_completer(text: str, state: int):
+    """Shell-like filesystem completion for interactive path prompts."""
+    if readline is None:
+        return None
+    expanded = os.path.expanduser(text or "./")
+    matches = sorted(glob.glob(expanded + "*"))
+    results = []
+    home = str(Path.home())
+    for match in matches:
+        value = match + ("/" if os.path.isdir(match) else "")
+        if text.startswith("~") and value.startswith(home):
+            value = "~" + value[len(home):]
+        results.append(value)
+    return results[state] if state < len(results) else None
+
+
+def path_prompt(label: str, default: str | None = None) -> str:
+    """Prompt for a path with Tab completion when readline is available."""
+    suffix = f" [{default}]" if default is not None else ""
+    if readline is None:
+        value = input(f"{label}{suffix}: ").strip()
+        return value or (default or "")
+    old_completer = readline.get_completer()
+    old_delims = readline.get_completer_delims()
+    try:
+        readline.set_completer(_filesystem_completer)
+        readline.set_completer_delims("\t\n")
+        readline.parse_and_bind("tab: complete")
+        value = input(f"{label}{suffix}: ").strip()
+        return value or (default or "")
+    finally:
+        readline.set_completer(old_completer)
+        readline.set_completer_delims(old_delims)
 
 
 def prompt(label: str, default: str | None = None, validator=None) -> str:
@@ -1485,7 +1526,7 @@ def prompt_existing_scan_files() -> list[Path]:
     print("Multiple files may be comma-separated.")
 
     while True:
-        raw = input("Nmap output file(s): ").strip()
+        raw = path_prompt("Nmap output file(s)").strip()
 
         files = [
             Path(value.strip()).expanduser().resolve()
@@ -2002,7 +2043,7 @@ def main() -> int:
         raw = args.targets
 
         if not raw and not args.non_interactive:
-            raw = prompt(
+            raw = path_prompt(
                 "Target file, comma-separated targets, or one target"
             )
 
@@ -2061,7 +2102,7 @@ def main() -> int:
     output_dir = args.output_dir
 
     if not args.non_interactive:
-        output_dir = prompt(
+        output_dir = path_prompt(
             "Engagement output directory",
             output_dir or str(Path.cwd()),
         )

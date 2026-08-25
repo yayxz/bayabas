@@ -1,0 +1,11 @@
+Bayabas 0.10.17
+
+- Preserves modular Python layout (Core/ and Modules/).
+- Adds normalized SSL/TLS module database output under Database/SSL/IPv4 and IPv6.
+- Records TLS endpoints, hosts with weak ciphers, hosts without TLS 1.3,
+  hosts with legacy SSL/TLS, certificate issues, and client wildcard certificates.
+- Adds unique_weak_ciphers.txt as a deduplicated one-cipher-per-line collection.
+- Excludes common shared cloud-provider wildcard namespaces from the client
+  wildcard certificate list while retaining raw evidence/findings.
+- Final Nmap scan remains targeted -sV after open-port discovery.
+- IPv6 hostname handling retains -6 --resolve-all -n behavior.

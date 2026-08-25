@@ -1431,6 +1431,13 @@ def run(context) -> int:
 
     remove_stale(ssl_family_root)
 
+    # Normalized, module-specific database output. Raw/finding evidence remains
+    # under Findings/SSL; these files are intentionally simple inputs for
+    # reporting and later resume/correlation stages.
+    ssl_db_root = context.db_path.parent.parent / "SSL" / context.family_label
+    remove_stale(ssl_db_root)
+    ssl_db_root.mkdir(parents=True, exist_ok=True)
+
     candidates = open_tcp_targets(context)
 
     if not candidates:
@@ -1560,6 +1567,9 @@ def run(context) -> int:
 
         weak_hosts: set[tuple[str, int]] = set()
         weak_values: dict[str, set[str]] = {}
+        unique_weak_ciphers: set[str] = set()
+        tls13_hosts: set[tuple[str, int]] = set()
+        no_tls13_hosts: set[tuple[str, int]] = set()
         weak_evidence = ""
 
         legacy_hosts: list[tuple[str, int, set[str]]] = []
@@ -1622,7 +1632,22 @@ def run(context) -> int:
         # --------------------------------------------------------------
         for address, (stdout, command, parsed) in grouped_results.items():
             for port, (raw, protocols, weak) in parsed.items():
-                tls_ports_detected.add((address, port))
+                endpoint = (address, port)
+                tls_ports_detected.add(endpoint)
+                protocol_names = {str(p).upper().replace(" ", "") for p in protocols}
+                if any(p in {"TLSV1.3", "TLS1.3"} for p in protocol_names):
+                    tls13_hosts.add(endpoint)
+                else:
+                    no_tls13_hosts.add(endpoint)
+
+                for values in weak.values():
+                    for value in values:
+                        # Weak-values may also contain descriptive DH/protocol
+                        # strings. The unique cipher collection is deliberately
+                        # restricted to actual suite tokens.
+                        token = value.strip()
+                        if token.startswith("TLS_") or token.startswith("SSL_"):
+                            unique_weak_ciphers.add(token)
 
                 if weak:
                     weak_hosts.add((address, port))
@@ -1880,6 +1905,41 @@ def run(context) -> int:
             finding_count += len(wildcard_hosts)
 
         # --------------------------------------------------------------
+        # Normalized module database outputs.  These are intentionally simple
+        # list files so reporting and shell tooling do not need to parse the
+        # raw cipher module evidence.
+        # --------------------------------------------------------------
+        database_ssl = context.db_path.parent.parent / "SSL" / context.family_label
+        database_ssl.mkdir(parents=True, exist_ok=True)
+
+        unique_weak_ciphers = sorted({
+            value
+            for values in weak_values.values()
+            for value in values
+            if value and not value.lower().startswith(("nmap grade ", "no forward secrecy", "cbc mode", "export-grade", "short-key", "ssl", "tls"))
+        })
+        (database_ssl / "unique_weak_ciphers.txt").write_text(
+            "\n".join(unique_weak_ciphers) + ("\n" if unique_weak_ciphers else ""),
+            encoding="utf-8",
+        )
+        (database_ssl / "hosts_with_weak_ssl_ciphers.txt").write_text(
+            "".join(f"{host}:{port}\n" for host, port in sorted(weak_hosts)),
+            encoding="utf-8",
+        )
+        (database_ssl / "hosts_with_legacy_tls_ssl.txt").write_text(
+            "".join(f"{host}:{port}\n" for host, port, _protocols in sorted(legacy_hosts)),
+            encoding="utf-8",
+        )
+        (database_ssl / "hosts_with_certificate_issues.txt").write_text(
+            "".join(f"{host}:{port}\n" for host, port in sorted(certificate_hosts)),
+            encoding="utf-8",
+        )
+        (database_ssl / "wildcard_certificates.txt").write_text(
+            "\n".join(sorted(wildcard_names_found)) + ("\n" if wildcard_names_found else ""),
+            encoding="utf-8",
+        )
+
+        # --------------------------------------------------------------
         # Diagnostics are retained only if findings exist, consistent with
         # Bayabas' no-empty/no-false-positive output convention.
         # --------------------------------------------------------------
@@ -1912,6 +1972,59 @@ def run(context) -> int:
 
         elif ssl_family_root.exists():
             shutil.rmtree(ssl_family_root)
+
+        # --------------------------------------------------------------
+        # Normalized Database/SSL lists (one endpoint/item per line).
+        # A zero-result file is retained to prove the check was performed.
+        # --------------------------------------------------------------
+        def write_simple(name: str, lines) -> None:
+            values = sorted(set(lines))
+            (ssl_db_root / name).write_text(
+                "\n".join(values) + ("\n" if values else ""),
+                encoding="utf-8",
+            )
+
+        write_simple(
+            "tls_services.txt",
+            (f"{host}:{port}" for host, port in tls_ports_detected),
+        )
+        write_simple(
+            "hosts_with_weak_ssl_ciphers.txt",
+            (f"{host}:{port}" for host, port in weak_hosts),
+        )
+        write_simple("unique_weak_ciphers.txt", unique_weak_ciphers)
+        write_simple(
+            "hosts_without_tls13.txt",
+            (f"{host}:{port}" for host, port in no_tls13_hosts),
+        )
+        write_simple(
+            "hosts_with_legacy_tls_ssl.txt",
+            (f"{host}:{port}" for host, port, _protocols in legacy_hosts),
+        )
+        write_simple(
+            "hosts_with_certificate_issues.txt",
+            (f"{host}:{port}" for host, port in certificate_hosts),
+        )
+
+        # Wildcards belonging to common shared cloud-provider namespaces are
+        # evidence, but not client wildcard-certificate findings.
+        provider_suffixes = (
+            ".amazonaws.com", ".cloudfront.net", ".azurewebsites.net",
+            ".windows.net", ".googleapis.com", ".appspot.com",
+            ".cloudflare.net",
+        )
+        client_wildcards = [
+            name for name in wildcard_names_found
+            if not name.lower().lstrip("*").endswith(provider_suffixes)
+        ]
+        write_simple("client_wildcard_certificates.txt", client_wildcards)
+
+        issue_lines = []
+        for (host, port), labels in sorted(certificate_hosts.items()):
+            issue_lines.append(
+                f"{host}:{port}\t" + "; ".join(sorted(labels))
+            )
+        write_simple("certificate_issues.txt", issue_lines)
 
         return finding_count
 
