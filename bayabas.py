@@ -38,7 +38,7 @@ except ImportError:
     readline = None
 
 APP = "Bayabas"
-VERSION = "0.10.20"
+VERSION = "0.10.21"
 ROOT = Path(__file__).resolve().parent
 MODULES_DIR = ROOT / "Modules"
 

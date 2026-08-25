@@ -1,10 +1,10 @@
-"""Bayabas TLS/SSL audit module (classifier revision 0.10.3).
+"""Bayabas TLS/SSL audit module (classifier revision 0.10.4).
 
 Workflow:
 1. Read open TCP services from the current IPv4/IPv6 inventory.
 2. Run ProjectDiscovery httpx for web/TLS enrichment only.
-3. Group every open TCP port by host.
-4. Run one Nmap ssl-enum-ciphers + ssl-dh-params scan per host across all open TCP ports.
+3. Select TLS/SSL endpoints positively identified by the final -sV inventory.
+4. Group TLS ports by (IP, hostname/SNI) and run one Nmap ssl-enum-ciphers + ssl-dh-params scan per context.
 5. Perform native certificate validation with Python ssl + cryptography.
 6. Create finding output only when validated findings exist.
 
@@ -89,11 +89,12 @@ def bracket(host: str) -> str:
     return host
 
 
-def open_tcp_targets(context) -> list[tuple[str, int]]:
+def tls_service_targets(context) -> list[tuple[str, int]]:
+    """Return open TCP endpoints positively identified as TLS/SSL by final -sV."""
     with context.connect() as db:
         rows = db.execute(
             """
-            SELECT h.address, p.port
+            SELECT h.address, p.port, p.service, p.product, p.tunnel
             FROM hosts h
             JOIN ports p ON p.host_id = h.id
             WHERE h.scan_id = ?
@@ -104,10 +105,25 @@ def open_tcp_targets(context) -> list[tuple[str, int]]:
             (context.scan_id,),
         ).fetchall()
 
-    return [
-        (row["address"], int(row["port"]))
-        for row in rows
-    ]
+    targets: list[tuple[str, int]] = []
+    for row in rows:
+        service = str(row["service"] or "").lower()
+        product = str(row["product"] or "").lower()
+        tunnel = str(row["tunnel"] or "").lower()
+        evidence = " ".join((service, product, tunnel))
+
+        # Final -sV commonly records TLS as tunnel="ssl", service names such
+        # as https/ssl/*, or TLS-bearing product/service descriptions.
+        if (
+            tunnel == "ssl"
+            or service == "https"
+            or service.startswith("ssl")
+            or " ssl" in f" {evidence}"
+            or "tls" in evidence
+        ):
+            targets.append((row["address"], int(row["port"])))
+
+    return targets
 
 
 def associated_names(context, address: str) -> list[str]:
@@ -1238,18 +1254,30 @@ def check_certificate(
 # Grouped TLS scanning
 # --------------------------------------------------------------------------
 
-def group_open_tcp_targets(
+def group_tls_targets(
+    context,
     candidates: list[tuple[str, int]],
-) -> dict[str, list[int]]:
-    grouped: dict[str, set[int]] = defaultdict(set)
+) -> dict[tuple[str, str | None], list[int]]:
+    """Group all discovered TLS ports by concrete IP and hostname/SNI context."""
+    grouped: dict[tuple[str, str | None], set[int]] = defaultdict(set)
 
     for address, port in candidates:
-        grouped[address].add(int(port))
+        names = associated_names(context, address)
+        if names:
+            for name in names:
+                grouped[(address, name)].add(int(port))
+        else:
+            grouped[(address, None)].add(int(port))
 
     return {
-        address: sorted(ports)
-        for address, ports in grouped.items()
+        key: sorted(ports)
+        for key, ports in grouped.items()
     }
+
+
+def endpoint_display(context, address: str, port: int, sni: str | None = None) -> str:
+    name = sni or (associated_names(context, address)[0] if associated_names(context, address) else None)
+    return f"{name} ({address}):{port}" if name else f"{address}:{port}"
 
 
 def safe_host_token(address: str) -> str:
@@ -1335,13 +1363,13 @@ def parse_grouped_nmap_tls(
 def run_grouped_tls_scan(
     context,
     address: str,
+    sni: str | None,
     ports: list[int],
     temp: Path,
 ) -> tuple[str, list[str], dict[int, tuple[str, set[str], dict[str, set[str]]]]]:
-    """Run one Nmap process for all open TCP ports on a host."""
-    xml = temp / f"tls_{safe_host_token(address)}.xml"
-    names = associated_names(context, address)
-    sni = names[0] if names else None
+    """Run one Nmap process for all TLS ports in one IP/SNI context."""
+    suffix = f"_{safe_host_token(sni)}" if sni else ""
+    xml = temp / f"tls_{safe_host_token(address)}{suffix}.xml"
 
     command = [
         context.nmap_path,
@@ -1438,17 +1466,34 @@ def run(context) -> int:
     remove_stale(ssl_db_root)
     ssl_db_root.mkdir(parents=True, exist_ok=True)
 
-    candidates = open_tcp_targets(context)
+    candidates = tls_service_targets(context)
 
     if not candidates:
-        print(f"[*] cipher/{context.family_label}: no open TCP ports in inventory.")
+        print(
+            f"[*] cipher/{context.family_label}: "
+            "no TLS/SSL services identified by the final service scan."
+        )
         return 0
 
-    grouped = group_open_tcp_targets(candidates)
+    grouped = group_tls_targets(context, candidates)
+
+    # Stable handoff artifact from final -sV inventory to cipher analysis.
+    endpoint_lines: list[str] = []
+    for (address, sni), ports in sorted(grouped.items(), key=lambda item: (item[0][0], item[0][1] or "")):
+        for port in ports:
+            endpoint_lines.append(endpoint_display(context, address, port, sni))
+    (ssl_db_root / "tls_endpoints.txt").write_text(
+        "\n".join(endpoint_lines) + ("\n" if endpoint_lines else ""),
+        encoding="utf-8",
+    )
 
     print(
         f"[*] cipher/{context.family_label}: "
-        f"{len(candidates)} open TCP endpoint(s) across {len(grouped)} host(s)."
+        f"{len(candidates)} TLS endpoint(s), {len(grouped)} IP/SNI scan context(s)."
+    )
+    print(
+        f"[+] cipher/{context.family_label}: TLS endpoint list: "
+        f"{ssl_db_root / 'tls_endpoints.txt'}"
     )
 
     x509_module = load_cryptography()
@@ -1480,7 +1525,7 @@ def run(context) -> int:
 
         print(
             f"[*] cipher/{context.family_label}: "
-            f"prepared {len(httpx_targets)} DB-derived TCP endpoint(s) for httpx."
+            f"prepared {len(httpx_targets)} TLS endpoint(s) for httpx enrichment."
         )
 
         binary = find_httpx()
@@ -1585,11 +1630,11 @@ def run(context) -> int:
         workers = min(4, max(1, len(grouped)))
         print(
             f"[*] cipher/{context.family_label}: running {len(grouped)} "
-            f"host-level TLS scan(s), concurrency={workers}."
+            f"IP/SNI-grouped TLS scan(s), concurrency={workers}."
         )
 
         grouped_results: dict[
-            str,
+            tuple[str, str | None],
             tuple[str, list[str], dict[int, tuple[str, set[str], dict[str, set[str]]]]],
         ] = {}
 
@@ -1599,38 +1644,40 @@ def run(context) -> int:
                     run_grouped_tls_scan,
                     context,
                     address,
+                    sni,
                     ports,
                     temp,
-                ): (address, ports)
-                for address, ports in grouped.items()
+                ): (address, sni, ports)
+                for (address, sni), ports in grouped.items()
             }
 
             for future in as_completed(future_map):
-                address, ports = future_map[future]
+                address, sni, ports = future_map[future]
 
                 try:
                     stdout, command, parsed = future.result()
                 except Exception as exc:
                     parser_warnings.append(
-                        f"{address}: grouped TLS scan failed: {exc}"
+                        f"{endpoint_display(context, address, ports[0], sni)}: grouped TLS scan failed: {exc}"
                     )
                     continue
 
-                grouped_results[address] = (
+                grouped_results[(address, sni)] = (
                     stdout,
                     command,
                     parsed,
                 )
 
+                label = f"{sni} ({address})" if sni else address
                 print(
-                    f"    {address}: {len(ports)} port(s) checked, "
+                    f"    {label}: ports {','.join(map(str, ports))}; "
                     f"TLS script data on {len(parsed)} port(s)."
                 )
 
         # --------------------------------------------------------------
         # Consume parsed TLS results.
         # --------------------------------------------------------------
-        for address, (stdout, command, parsed) in grouped_results.items():
+        for (address, sni), (stdout, command, parsed) in grouped_results.items():
             for port, (raw, protocols, weak) in parsed.items():
                 endpoint = (address, port)
                 tls_ports_detected.add(endpoint)

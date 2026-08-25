@@ -1,0 +1,6 @@
+Bayabas 0.10.21
+- cipher.py now consumes TLS/SSL services identified by the final -sV inventory.
+- Writes Database/SSL/<family>/tls_endpoints.txt using hostname (IP):port where available.
+- Groups all TLS ports for the same (IP, hostname/SNI) context into one Nmap TLS audit invocation.
+- Preserves separate SNI contexts when multiple hostnames share one IP.
+- IPv4/IPv6 handling remains separate.
