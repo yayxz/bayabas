@@ -38,7 +38,7 @@ except ImportError:
     readline = None
 
 APP = "Bayabas"
-VERSION = "0.10.21"
+VERSION = "0.10.22"
 ROOT = Path(__file__).resolve().parent
 MODULES_DIR = ROOT / "Modules"
 
@@ -930,7 +930,7 @@ def discovery_command(nmap: str, context: FamilyContext, dns: str | None) -> lis
 
     command = [
         nmap, *nmap_family_arg(context.family), "-sn", *probes,
-        "--reason", "-v", "-iL", str(context.original_targets_file),
+        "--reason", "-n", "-v", "-iL", str(context.original_targets_file),
         "-oA", str(context.discovery_dir / "host_discovery"),
     ]
     if dns:
@@ -2126,6 +2126,246 @@ def read_db_resolution_mappings(context: FamilyContext):
     return result
 
 
+
+def split_targets_from_cached_resolution(
+    targets: list[str],
+    mappings: set[tuple[str, str, str]],
+    ipv6_dns_with: list[tuple[str, str]],
+    ipv6_enabled: bool,
+) -> tuple[list[str], list[str], set[tuple[str, str, str, int]]]:
+    """Build scan targets from the already-completed DNS enrichment pass."""
+    ipv4: set[str] = set()
+    ipv6: set[str] = set()
+    normalized: set[tuple[str, str, str, int]] = set()
+    supplied_hosts = set(target_hostnames(targets))
+
+    for target in targets:
+        kind = classify_target(target)
+        if kind == "ipv4":
+            ipv4.add(target)
+        elif kind == "ipv6" and ipv6_enabled:
+            ipv6.add(target)
+
+    for hostname, address, source in mappings:
+        try:
+            family = ipaddress.ip_address(address).version
+        except ValueError:
+            continue
+        normalized.add((hostname, address, source, family))
+        # Only exact supplied hostnames expand active scan scope here.
+        if hostname not in supplied_hosts:
+            continue
+        if family == 4:
+            ipv4.add(address)
+
+    if ipv6_enabled:
+        for hostname, address in ipv6_dns_with:
+            normalized.add((hostname, address, "aaaa-target", 6))
+            if hostname in supplied_hosts:
+                # Preserve hostname so Nmap -6 --resolve-all -n scans every AAAA.
+                ipv6.add(hostname)
+
+    return sorted(ipv4), sorted(ipv6), normalized
+
+
+def write_target_intelligence_artifacts(
+    assessment_root: Path,
+    targets: list[str],
+    mappings: set[tuple[str, str, str]],
+    ipv6_dns_with: list[tuple[str, str]],
+    ipv6_dns_without: list[str],
+    assessment_type: str,
+    client_domains: list[str],
+) -> dict[str, Any]:
+    """Persist the DNS/cloud analysis shown during target intake."""
+    database = assessment_root / "Database"
+    dns_dir = database / "DNS"
+    cloud_dir = database / "Cloud"
+    dns_dir.mkdir(parents=True, exist_ok=True)
+    cloud_dir.mkdir(parents=True, exist_ok=True)
+
+    hostnames = target_hostnames(targets)
+    by_host: dict[str, dict[str, set[str]]] = {
+        host: {"ipv4": set(), "ipv6": set(), "sources": set()} for host in hostnames
+    }
+    for hostname, address, source in mappings:
+        if hostname not in by_host:
+            by_host[hostname] = {"ipv4": set(), "ipv6": set(), "sources": set()}
+        try:
+            family = ipaddress.ip_address(address).version
+        except ValueError:
+            continue
+        by_host[hostname]["ipv4" if family == 4 else "ipv6"].add(address)
+        by_host[hostname]["sources"].add(source)
+    for hostname, address in ipv6_dns_with:
+        if hostname not in by_host:
+            by_host[hostname] = {"ipv4": set(), "ipv6": set(), "sources": set()}
+        by_host[hostname]["ipv6"].add(address)
+        by_host[hostname]["sources"].add("aaaa-target")
+
+    resolved = [h for h in hostnames if by_host.get(h, {}).get("ipv4") or by_host.get(h, {}).get("ipv6")]
+    unresolved = [h for h in hostnames if h not in resolved]
+    all_v4 = sorted({a for d in by_host.values() for a in d["ipv4"]}, key=ipaddress.ip_address)
+    all_v6 = sorted({a for d in by_host.values() for a in d["ipv6"]}, key=ipaddress.ip_address)
+    raw_v4_mappings = sum(len(by_host[h]["ipv4"]) for h in hostnames if h in by_host)
+    raw_v6_mappings = sum(len(by_host[h]["ipv6"]) for h in hostnames if h in by_host)
+    multiple = [h for h in hostnames if len(by_host[h]["ipv4"] | by_host[h]["ipv6"]) > 1]
+    with_v6_hosts = sorted({h for h, _ in ipv6_dns_with})
+
+    cloud_records=[]
+    provider_counts: dict[tuple[str,str], int] = {}
+    for host in hostnames:
+        hit=classify_shared_provider_hostname(host)
+        if hit:
+            provider, service, suffix=hit
+            cloud_records.append({
+                "hostname": host,
+                "provider": provider,
+                "service": service,
+                "shared_namespace": suffix,
+                "classification": "EXPLICIT_CLOUD_RESOURCE",
+                "scope": "EXPLICIT_TARGET",
+            })
+            provider_counts[(provider,service)] = provider_counts.get((provider,service),0)+1
+
+    # Human-readable DNS summary + per-host records.
+    lines=[
+        "="*60,
+        " DNS RESOLUTION ANALYSIS",
+        "="*60,
+        "",
+        f"Hostnames analyzed:               {len(hostnames):>6}",
+        f"Successfully resolved:            {len(resolved):>6}",
+        f"Unresolved:                       {len(unresolved):>6}",
+        "",
+        f"DNS IPv4 mappings:                {raw_v4_mappings:>6}",
+        f"Unique IPv4 addresses:            {len(all_v4):>6}",
+        f"Unique IPv6 addresses:            {len(all_v6):>6}",
+        f"Hosts with multiple resolutions:  {len(multiple):>6}",
+        "",
+        f"Hostnames with IPv6 (AAAA):       {len(with_v6_hosts):>6}",
+        f"Hostnames without IPv6 (AAAA):    {len(ipv6_dns_without):>6}",
+        "",
+        f"Cloud/CDN-backed hostnames:        {len(cloud_records):>6}",
+        "",
+    ]
+    duplicate_v4=max(0,raw_v4_mappings-len(all_v4))
+    if duplicate_v4:
+        lines += [f"Duplicate/shared IPv4 mappings:   {duplicate_v4:>6}", ""]
+    for host in hostnames:
+        d=by_host[host]
+        hit=classify_shared_provider_hostname(host)
+        lines += ["-"*60, f"HOSTNAME: {host}"]
+        if d["ipv4"]:
+            lines.append("A:")
+            lines.extend(f"    {x}" for x in sorted(d["ipv4"], key=ipaddress.ip_address))
+        else:
+            lines.append("A: NONE")
+        if d["ipv6"]:
+            lines.append("AAAA:")
+            lines.extend(f"    {x}" for x in sorted(d["ipv6"], key=ipaddress.ip_address))
+        else:
+            lines.append("AAAA: NONE")
+        lines.append(f"IPv4 count: {len(d['ipv4'])}")
+        lines.append(f"IPv6 count: {len(d['ipv6'])}")
+        lines.append(f"Multiple resolutions: {'YES' if len(d['ipv4']|d['ipv6'])>1 else 'NO'}")
+        if hit:
+            provider,service,suffix=hit
+            lines += [f"Provider: {provider}",f"Service: {service}",f"Shared provider namespace: {suffix}"]
+        lines.append(f"Status: {'RESOLVED' if host in resolved else 'UNRESOLVED'}")
+        lines.append("")
+    (dns_dir / "dns_resolution_analysis.txt").write_text("\n".join(lines)+"\n",encoding="utf-8")
+
+    json_data={
+        "assessment_type": assessment_type,
+        "client_domains": client_domains,
+        "summary": {
+            "hostnames_analyzed": len(hostnames),
+            "successfully_resolved": len(resolved),
+            "unresolved": len(unresolved),
+            "dns_ipv4_mappings": raw_v4_mappings,
+            "dns_ipv6_mappings": raw_v6_mappings,
+            "unique_ipv4_addresses": len(all_v4),
+            "unique_ipv6_addresses": len(all_v6),
+            "hosts_with_multiple_resolutions": len(multiple),
+            "hostnames_with_ipv6": len(with_v6_hosts),
+            "hostnames_without_ipv6": len(ipv6_dns_without),
+            "cloud_cdn_backed_hostnames": len(cloud_records),
+        },
+        "hostnames": {},
+    }
+    for host in hostnames:
+        d=by_host[host]
+        hit=classify_shared_provider_hostname(host)
+        rec={
+            "ipv4": sorted(d["ipv4"],key=ipaddress.ip_address),
+            "ipv6": sorted(d["ipv6"],key=ipaddress.ip_address),
+            "ipv4_count":len(d["ipv4"]),
+            "ipv6_count":len(d["ipv6"]),
+            "multiple_resolutions":len(d["ipv4"]|d["ipv6"])>1,
+            "status":"RESOLVED" if host in resolved else "UNRESOLVED",
+            "sources":sorted(d["sources"]),
+        }
+        if hit:
+            rec.update({"provider":hit[0],"service":hit[1],"shared_provider_namespace":hit[2]})
+        json_data["hostnames"][host]=rec
+    (dns_dir / "dns_resolution.json").write_text(json.dumps(json_data,indent=2,sort_keys=True)+"\n",encoding="utf-8")
+    write_lines(dns_dir / "resolved_hostnames.txt",resolved)
+    write_lines(dns_dir / "unresolved_hostnames.txt",unresolved)
+    write_lines(dns_dir / "hostnames_with_ipv6.txt",[f"{h}\t{a}" for h,a in ipv6_dns_with])
+    write_lines(dns_dir / "hostnames_without_ipv6.txt",ipv6_dns_without)
+    write_lines(dns_dir / "multiple_resolutions.txt",multiple)
+
+    cloud_lines=["="*60," CLOUD RESOURCE CLASSIFICATION","="*60,""]
+    for rec in cloud_records:
+        cloud_lines += [
+            f"HOSTNAME: {rec['hostname']}",
+            f"Provider: {rec['provider']}",
+            f"Service: {rec['service']}",
+            f"Shared namespace: {rec['shared_namespace']}",
+            "Classification: EXPLICIT_CLOUD_RESOURCE",
+            "Scope: EXPLICIT_TARGET",
+            "Provider namespace passive enumeration: DISABLED",
+            "",
+        ]
+    (cloud_dir / "cloud_resources.txt").write_text("\n".join(cloud_lines)+"\n",encoding="utf-8")
+    (cloud_dir / "cloud_resources.json").write_text(json.dumps(cloud_records,indent=2,sort_keys=True)+"\n",encoding="utf-8")
+
+    return {
+        "hostnames":len(hostnames),"resolved":len(resolved),"unresolved":len(unresolved),
+        "raw_v4_mappings":raw_v4_mappings,"unique_v4":len(all_v4),"unique_v6":len(all_v6),
+        "multiple":len(multiple),"with_v6":len(with_v6_hosts),"without_v6":len(ipv6_dns_without),
+        "duplicate_v4":duplicate_v4,"cloud":len(cloud_records),"provider_counts":provider_counts,
+        "dns_analysis":str(dns_dir/"dns_resolution_analysis.txt"),
+        "dns_json":str(dns_dir/"dns_resolution.json"),
+        "cloud_analysis":str(cloud_dir/"cloud_resources.txt"),
+    }
+
+
+def print_target_intelligence(targets: list[str], assessment_type: str) -> None:
+    hosts=target_hostnames(targets)
+    v4=sum(1 for t in targets if classify_target(t)=="ipv4")
+    v6=sum(1 for t in targets if classify_target(t)=="ipv6")
+    cloud=[(h,classify_shared_provider_hostname(h)) for h in hosts if classify_shared_provider_hostname(h)]
+    print("\n"+"="*60)
+    print(" TARGET INTELLIGENCE")
+    print("="*60+"\n")
+    print(f"[*] Loaded {len(targets)} target(s).\n")
+    print(f"    Hostnames:                       {len(hosts):>6}")
+    print(f"    IPv4 addresses/CIDRs:            {v4:>6}")
+    print(f"    IPv6 addresses/CIDRs:            {v6:>6}")
+    print(f"\n[*] Assessment workflow: {assessment_type.upper()}")
+    if cloud:
+        print("\n[*] Classifying supplied targets...\n")
+        print(f"[+] Cloud-provider resources:        {len(cloud):>6}")
+        client_count=len(hosts)-len(cloud)
+        print(f"[+] Client/other hostnames:           {client_count:>6}")
+        counts={}
+        for _h,hit in cloud:
+            counts[(hit[0],hit[1])]=counts.get((hit[0],hit[1]),0)+1
+        for (provider,service),count in sorted(counts.items()):
+            print(f"\nProvider: {provider}\nService:  {service}\nTargets:  {count}")
+
 def main() -> int:
     global CURRENT_ASSESSMENT_PATH
     args = parser().parse_args()
@@ -2177,13 +2417,16 @@ def main() -> int:
     assessment_type = "import"
     client_domains: list[str] = []
 
+    output_dir = args.output_dir
+    assessment_root: Path | None = None
+    assessment_path: Path | None = None
+    intelligence_stats: dict[str, Any] = {}
+
     if not import_mode:
         raw = args.targets
 
         if not raw and not args.non_interactive:
-            raw = path_prompt(
-                "Target file, comma-separated targets, or one target"
-            )
+            raw = path_prompt("Target file, comma-separated targets, or one target")
 
         if not raw:
             die("Targets are required when an existing Nmap scan is not imported.")
@@ -2191,11 +2434,30 @@ def main() -> int:
         targets = load_targets(raw)
         advise_terminal_multiplexer(estimate_target_scale(targets), args.non_interactive)
 
+        # Select/create the engagement directory before DNS enrichment so every
+        # intelligence artifact can be checkpointed immediately.
+        if not args.non_interactive:
+            output_dir = path_prompt(
+                "Engagement output directory",
+                output_dir or str(Path.cwd()),
+            )
+        if not output_dir:
+            die("--output-dir is required in non-interactive mode.")
+        assessment_root = Path(output_dir).expanduser().resolve()
+        assessment_root.mkdir(parents=True, exist_ok=True)
+        assessment_path = assessment_root / "assessment.json"
+        if assessment_path.exists():
+            die("Engagement directory already contains assessment.json: " + str(assessment_root))
+        CURRENT_ASSESSMENT_PATH = assessment_path
+
         assessment_type = args.assessment_type or infer_assessment_type(targets)
         if not args.non_interactive:
             print(f"[*] Recommended assessment type: {assessment_type.upper()}")
             if not yes_no(f"Use {assessment_type.upper()} workflow?", True):
                 assessment_type = "internal" if assessment_type == "external" else "external"
+
+        print_target_intelligence(targets, assessment_type)
+
         client_domains = normalize_client_domains(args.client_domain)
         supplied_hosts = target_hostnames(targets)
         all_hosts_are_shared_provider = bool(supplied_hosts) and all(
@@ -2203,70 +2465,83 @@ def main() -> int:
         )
         if not args.non_interactive and not client_domains:
             if assessment_type == "external" and all_hosts_are_shared_provider:
-                print("[*] All supplied hostname targets are recognized shared cloud-provider resources.")
-                print("[*] Client-domain passive enumeration prompt skipped; exact targets will still receive DNS resolution/enrichment.")
+                print("\n[*] All supplied hostname targets are recognized shared cloud-provider resources.")
+                print("[*] Passive client-domain enumeration: SKIPPED")
+                print("[*] Exact-target DNS enrichment: ENABLED")
             else:
                 entered = prompt("Client domain(s) for authorized DNS enumeration (comma-separated, blank = skip)", "")
                 client_domains = normalize_client_domains([entered]) if entered else []
-        print(f"[*] Assessment workflow: {assessment_type.upper()}")
         if client_domains:
             print("[*] Authorized client domain(s): " + ", ".join(client_domains))
 
-        # External passive enumeration is performed after the Database directory exists.
+        print("\n"+"="*60)
+        print(" DNS RESOLUTION")
+        print("="*60+"\n")
+        print(f"[*] Resolving {len(supplied_hosts)} hostname target(s) and enriching supplied IP targets...")
         preflight_mappings = run_core_resolution(targets, dns)
         ipv6_dns_with, ipv6_dns_without = classify_hostname_ipv6(targets, dns)
 
-        ipv6_enabled = args.ipv6
+        intelligence_stats = write_target_intelligence_artifacts(
+            assessment_root, targets, preflight_mappings, ipv6_dns_with,
+            ipv6_dns_without, assessment_type, client_domains,
+        )
+        print("\n[*] DNS resolution completed.\n")
+        print(f"Hostnames analyzed:                 {intelligence_stats['hostnames']:>6}")
+        print(f"Successfully resolved:              {intelligence_stats['resolved']:>6}")
+        print(f"Unresolved:                         {intelligence_stats['unresolved']:>6}")
+        print("")
+        print(f"DNS IPv4 mappings:                  {intelligence_stats['raw_v4_mappings']:>6}")
+        print(f"Unique IPv4 addresses:              {intelligence_stats['unique_v4']:>6}")
+        print(f"Unique IPv6 addresses:              {intelligence_stats['unique_v6']:>6}")
+        print(f"Hosts with multiple resolutions:    {intelligence_stats['multiple']:>6}")
+        print("")
+        print(f"Hostnames with IPv6 (AAAA):         {intelligence_stats['with_v6']:>6}")
+        print(f"Hostnames without IPv6 (AAAA):      {intelligence_stats['without_v6']:>6}")
+        if intelligence_stats['duplicate_v4']:
+            print(f"\n[*] {intelligence_stats['duplicate_v4']} duplicate/shared IPv4 mapping(s) detected.")
+        if intelligence_stats['cloud']:
+            print("[*] Cloud-provider addresses are service infrastructure; resolved IP count does not imply independent client-owned hosts.")
+        print(f"\n[+] DNS analysis:\n    {intelligence_stats['dns_analysis']}")
+        print(f"\n[+] Detailed DNS records:\n    {intelligence_stats['dns_json']}")
+        print(f"\n[+] Cloud classification:\n    {intelligence_stats['cloud_analysis']}")
+
+        direct_ipv6 = any(classify_target(t) == "ipv6" for t in targets)
+        ipv6_available = bool(ipv6_dns_with) or direct_ipv6
+        ipv6_enabled = bool(args.ipv6)
         if not args.non_interactive:
-            ipv6_enabled = yes_no("Run IPv6 scans (-6) as well?", False)
+            if ipv6_available:
+                print(f"\n[+] IPv6-capable target(s) discovered: {len({h for h,_ in ipv6_dns_with}) + (1 if direct_ipv6 else 0)}")
+                ipv6_enabled = yes_no("Run separate IPv6 scans (-6) as well?", True)
+            else:
+                print("\n[*] No IPv6-capable targets discovered.")
+                print("[*] IPv6 scanning skipped automatically.")
+                ipv6_enabled = False
 
-        ipv4_targets, ipv6_targets, explicit_mappings = split_targets(
-            targets,
-            ipv6_enabled,
-            dns,
+        ipv4_targets, ipv6_targets, explicit_mappings = split_targets_from_cached_resolution(
+            targets, preflight_mappings, ipv6_dns_with, ipv6_enabled,
         )
-
-        explicit_mappings.update(
-            (
-                hostname,
-                address,
-                source,
-                ipaddress.ip_address(address).version,
-            )
-            for hostname, address, source in preflight_mappings
-            if ipaddress.ip_address(address).version in (4, 6)
-        )
-
         if not ipv4_targets and not ipv6_targets:
             die("No targets resolved for the selected address families.")
-
-        # With raw targets and no imported Nmap inventory, discovery is a
-        # mandatory pre-scan stage. This intentionally happens before port
-        # and timing prompts so dead hosts are removed from scan scope first.
         host_discovery = True
 
-    output_dir = args.output_dir
+    if import_mode:
+        output_dir = args.output_dir
+        if not args.non_interactive:
+            output_dir = path_prompt(
+                "Engagement output directory",
+                output_dir or str(Path.cwd()),
+            )
+        if not output_dir:
+            die("--output-dir is required in non-interactive mode.")
+        assessment_root = Path(output_dir).expanduser().resolve()
+        assessment_root.mkdir(parents=True, exist_ok=True)
+        assessment_path = assessment_root / "assessment.json"
+        if assessment_path.exists():
+            die("Engagement directory already contains assessment.json: " + str(assessment_root))
+        CURRENT_ASSESSMENT_PATH = assessment_path
 
-    if not args.non_interactive:
-        output_dir = path_prompt(
-            "Engagement output directory",
-            output_dir or str(Path.cwd()),
-        )
-
-    if not output_dir:
-        die("--output-dir is required in non-interactive mode.")
-
-    assessment_root = Path(output_dir).expanduser().resolve()
-    assessment_root.mkdir(parents=True, exist_ok=True)
-
-    assessment_path = assessment_root / "assessment.json"
-    if assessment_path.exists():
-        die(
-            "Engagement directory already contains assessment.json: "
-            f"{assessment_root}"
-        )
-
-    CURRENT_ASSESSMENT_PATH = assessment_path
+    assert assessment_root is not None
+    assert assessment_path is not None
 
     # Imported Nmap results define their own targets/address families.
     imported_family_records: dict[int, list[dict[str, Any]]] = {4: [], 6: []}
@@ -2330,6 +2605,11 @@ def main() -> int:
     }
     if import_mode:
         assessment["port_plan"] = {"description": "imported Nmap output"}
+    elif intelligence_stats:
+        assessment["statistics"]["target_intelligence"] = intelligence_stats
+        assessment["artifacts"]["dns_analysis"] = intelligence_stats.get("dns_analysis", "")
+        assessment["artifacts"]["dns_resolution_json"] = intelligence_stats.get("dns_json", "")
+        assessment["artifacts"]["cloud_analysis"] = intelligence_stats.get("cloud_analysis", "")
     write_assessment(assessment_path, assessment)
 
     contexts: list[FamilyContext] = []

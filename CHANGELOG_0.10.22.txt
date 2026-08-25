@@ -1,0 +1,10 @@
+Bayabas 0.10.22
+- Target/engagement output directory is selected before DNS enrichment so intelligence artifacts are checkpointed immediately.
+- Added real TARGET INTELLIGENCE and DNS RESOLUTION console summaries.
+- DNS enrichment results are cached and reused; removed the redundant second hostname-resolution pass before scanning.
+- IPv6 scanning prompt is only shown when AAAA/direct IPv6 targets actually exist; otherwise IPv6 is skipped automatically.
+- Added Database/DNS/dns_resolution_analysis.txt and dns_resolution.json.
+- Added Database/DNS/resolved_hostnames.txt, unresolved_hostnames.txt, hostnames_with_ipv6.txt, hostnames_without_ipv6.txt, and multiple_resolutions.txt.
+- Added Database/Cloud/cloud_resources.txt and cloud_resources.json for explicit shared-provider target classification.
+- Nmap host discovery now uses -n because Bayabas already performed DNS enrichment.
+- Preserves v0.10.20 Interactive Scan/User Flags validation and v0.10.21 grouped TLS cipher scanning by (IP,SNI) context.
