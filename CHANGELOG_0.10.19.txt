@@ -1,0 +1,9 @@
+Bayabas 0.10.19
+================
+
+- Prefer TCP SYN scanning (-sS) for TCP port discovery and final TCP service scans.
+- Preserve --mtu support with SYN/UDP scan modes; incompatible TCP connect (-sT) construction is no longer used.
+- Automatically add --reason to initial and final scans for auditable Nmap state evidence.
+- Automatically add -n to initial port discovery to avoid redundant reverse-DNS work after Bayabas DNS enrichment.
+- Final hostname scans retain --resolve-all -n and IPv6 family separation.
+- Existing adaptive port profiles, scan timing prompts, DNS/cloud classification, and module structure are retained.

@@ -875,10 +875,10 @@ def discovery_command(nmap: str, context: FamilyContext, dns: str | None) -> lis
 
 def scan_modes(plan: PortPlan) -> list[str]:
     if plan.tcp and plan.udp:
-        return ["-sS" if os.geteuid() == 0 else "-sT", "-sU"]
+        return ["-sS", "-sU"]
     if plan.udp:
         return ["-sU"]
-    return ["-sS" if os.geteuid() == 0 else "-sT"]
+    return ["-sS"]
 
 
 def initial_command(
@@ -890,7 +890,7 @@ def initial_command(
     dns: str | None,
     discovery_done: bool,
 ) -> list[str]:
-    command = [nmap, *nmap_family_arg(context.family), "--open", "-v", "-iL", str(target_file)]
+    command = [nmap, *nmap_family_arg(context.family), "--open", "--reason", "-n", "-v", "-iL", str(target_file)]
     if discovery_done:
         command.append("-Pn")
     command += scan_modes(plan) + plan.args + timing
@@ -983,16 +983,16 @@ def final_command(
 ) -> list[str]:
     assert context.final_output_base is not None
     command = [
-        nmap, *nmap_family_arg(context.family), "--open", "-v",
+        nmap, *nmap_family_arg(context.family), "--open", "--reason", "-v",
         "--resolve-all", "-n", "-Pn",
         "-iL", str(context.initial_live_hosts_file), "-sV",
     ]
     if tcp and udp:
-        command += ["-sS" if os.geteuid() == 0 else "-sT", "-sU"]
+        command += ["-sS", "-sU"]
     elif udp:
         command += ["-sU"]
     else:
-        command += ["-sS" if os.geteuid() == 0 else "-sT"]
+        command += ["-sS"]
     command += ["-p", port_expression(tcp, udp), *timing, "-oA", str(context.final_output_base)]
     return command
 
