@@ -20,7 +20,7 @@ dnspython      # Modules/caa.py, Modules/dnssec.py - CAA/DNSSEC DNS queries
 #
 #   nmap            required, system package   (apt install nmap)
 #   host             required, system package   (apt install dnsutils)
-#   screen           required, system package   (apt install screen)
+#   screen           optional, recommended for large scopes (apt install screen)
 #   nmblookup        optional, system package   (apt install samba-common-bin)
 #   nxc / NetExec    optional, separate tool    (pipx install netexec)
 #

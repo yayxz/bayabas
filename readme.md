@@ -1,4 +1,4 @@
-# Bayabas v0.10.14
+# Bayabas v0.10.15
 
 The selected output directory is the single engagement root:
 
@@ -27,8 +27,7 @@ SD/
 ```
 
 `Core/resolve.py` runs before scans/modules and prompts once for DNS through
-the main launcher. Required dependencies are `nmap` and `host`; `nmblookup`
-and `nxc` are optional enrichment.
+the main launcher. Required dependencies are `nmap` and `host`; `nmblookup` and `nxc` are optional enrichment. GNU `screen` is optional and is recommended only as a terminal multiplexer for large assessments; Bayabas no longer launches individual scans in detached Screen sessions.
 
 Python dependencies (`cryptography` for `cipher.py`, `dnspython` for
 `caa.py`/`dnssec.py`) can be installed up front with:
@@ -187,7 +186,7 @@ Added `requirements.txt` covering the project's pip dependencies
 (`cryptography`, `dnspython`) so they can all be installed in one shot
 with `pip install -r requirements.txt --break-system-packages` instead of
 being prompted per module on first use. Non-pip dependencies (`nmap`,
-`host`, `screen`, `nmblookup`, `nxc`, and the Go-based `httpx` binary used
+`host`, `nmblookup`, `nxc`, and the Go-based `httpx` binary used
 by `cipher.py`, not the PyPI package of the same name) are documented in
 the file as comments but are intentionally not part of the pip install,
 since pip can't provide them.
@@ -242,3 +241,25 @@ used to capture the wrapped command's real exit code rather than `tee`'s.
 Whenever a job's exit code is non-zero, `wait_jobs()` now also prints
 `[!] Full output saved to: <path>` immediately, pointing straight at the
 real error instead of just a bare "failed" message.
+
+
+## v0.10.15 Discovery-first scans and terminal-multiplexer cleanup
+
+When raw targets are supplied (rather than completed Nmap output), Bayabas now performs host discovery before asking for port or timing settings. The discovery command combines ICMP, TCP SYN/ACK, and UDP probes where privileges permit; Nmap's normal local-link ARP/ND behavior remains available automatically. Live addresses are persisted to `Database/host_discovery_list.txt` and to the relevant family database directory.
+
+Hostname targets are also checked for AAAA records. Results are written to `Database/hostnames_with_ipv6.txt` (`hostname<TAB>IPv6`) and `Database/hostnames_without_ipv6.txt`. If IPv6 scanning is enabled, hostname targets with AAAA records are retained as hostnames and Nmap receives `-6 --resolve-all -n`, allowing all IPv6 addresses returned for the hostname to be considered while suppressing reverse-DNS lookups.
+
+Bayabas no longer creates or manages detached GNU Screen sessions for discovery, initial, or final scans. Scans run as child processes of Bayabas, output is still logged, and an interrupt terminates the active child. For large target scopes (estimated at 250+ addresses, including CIDR size), Bayabas recommends running the entire program inside GNU Screen or tmux and shows a copy/paste Screen command. If Screen is not installed, common installation commands are displayed. Interactive users are prompted to run the entire Bayabas process inside GNU Screen when it is available; choosing yes re-executes Bayabas in one attached Screen session. If Screen is missing, Bayabas prints installation commands and asks whether to continue without it.
+
+## v0.10.16 targets-file DNS intelligence
+
+For raw targets-file assessments Bayabas now distinguishes INTERNAL and EXTERNAL workflows. URLs in target files are normalized to hostnames. The operator can provide one or more authorized client root domains with `--client-domain` (or interactively).
+
+For EXTERNAL assessments, Bayabas detects and uses all installed supported passive CLI enumerators: Subfinder, Amass (passive mode), Assetfinder, and Findomain. Missing optional dependencies are reported with installation guidance. Results are restricted to the supplied client domain namespace, merged/deduplicated, and provenance is written to `Database/subdomain_sources.txt`. Passive discoveries are DNS-resolved and written as intelligence but do not silently expand Nmap scan scope.
+
+Examples:
+
+    python3 bayabas.py targets.txt --assessment-type external --client-domain abc.com
+    python3 bayabas.py targets.txt --assessment-type internal --client-domain corp.abc.com
+
+Use only for systems and namespaces you are explicitly authorized to assess.

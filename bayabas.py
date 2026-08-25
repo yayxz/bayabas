@@ -26,12 +26,13 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from Core import resolve as core_resolve
 from typing import Any, Iterable
 
 APP = "Bayabas"
-VERSION = "0.10.14"
+VERSION = "0.10.16"
 ROOT = Path(__file__).resolve().parent
 MODULES_DIR = ROOT / "Modules"
 
@@ -43,7 +44,6 @@ TIME_RE = re.compile(r"^\d+(?:ms|s|m|h)?$", re.I)
 
 
 CURRENT_ASSESSMENT_PATH: Path | None = None
-ACTIVE_SCREEN_SESSIONS: set[str] = set()
 
 
 class GracefulInterrupt(Exception):
@@ -107,19 +107,6 @@ class ModuleContext:
         path = self.findings_dir.joinpath(*parts)
         path.mkdir(parents=True, exist_ok=True)
         return path
-
-
-@dataclass
-class ScreenJob:
-    session: str
-    label: str
-    command: list[str]
-    work_dir: Path
-    done_file: Path
-    exit_file: Path
-    wrapper: Path
-    log_file: Path
-    started: float
 
 
 def die(message: str, code: int = 1) -> None:
@@ -212,18 +199,81 @@ def resolve_assessment_root(base_output: str, assessment_name: str) -> Path:
     return assessment_root
 
 
-def ensure_dependencies() -> tuple[str, str]:
+def ensure_dependencies() -> str:
     nmap = shutil.which("nmap")
-    screen = shutil.which("screen")
     if not nmap:
         die("Nmap is not installed or available in PATH.")
+    return nmap
+
+
+LARGE_TARGET_THRESHOLD = 250
+
+
+def estimate_target_scale(targets: list[str], cap: int = 1_000_000_000) -> int:
+    """Estimate scope size without expanding CIDRs in memory."""
+    total = 0
+    for target in targets:
+        try:
+            total += ipaddress.ip_network(target, strict=False).num_addresses
+        except ValueError:
+            total += 1
+        if total >= cap:
+            return cap
+    return total
+
+
+def advise_terminal_multiplexer(target_count: int, non_interactive: bool) -> None:
+    """Offer to run the whole program in Screen for large scopes."""
+    if target_count < LARGE_TARGET_THRESHOLD or os.environ.get("STY") or os.environ.get("TMUX"):
+        return
+
+    argv = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]
+    command_text = " ".join(shlex.quote(x) for x in argv)
+    rerun = "screen -S bayabas bash -lc " + shlex.quote(command_text)
+    print(
+        f"[!] Large target scope detected (estimated {target_count} addresses/targets). "
+        "Long assessments are best run inside a terminal multiplexer such as GNU Screen "
+        "or tmux so a terminal disconnect does not terminate Bayabas."
+    )
+
+    screen = shutil.which("screen")
     if not screen:
-        die("GNU Screen is not installed. Install it before running Bayabas.")
-    return nmap, screen
+        print("[*] GNU Screen is not installed. Common install commands:")
+        print("    Debian/Ubuntu/Kali: sudo apt update && sudo apt install -y screen")
+        print("    RHEL/Fedora:        sudo dnf install -y screen")
+        print("    Alpine:             sudo apk add screen")
+        print("    macOS (Homebrew):   brew install screen")
+        print(f"[*] After installation, run: {rerun}")
+        if non_interactive:
+            print("[*] Non-interactive mode: continuing in the current terminal.")
+            return
+        if not yes_no("Continue without GNU Screen?", False):
+            raise SystemExit(0)
+        return
+
+    print(f"[*] Screen command: {rerun}")
+    if non_interactive:
+        print("[*] Non-interactive mode: continuing in the current terminal.")
+        return
+
+    if yes_no("Run the entire Bayabas process inside GNU Screen now?", True):
+        # Replace this process with one attached Screen session. The child
+        # Bayabas process sees $STY and therefore does not prompt again.
+        os.execvp(screen, [screen, "-S", "bayabas", *argv])
+
+
+def normalize_target(value: str) -> str:
+    value = value.strip()
+    if re.match(r"^https?://", value, re.I):
+        parsed = urlsplit(value)
+        if not parsed.hostname:
+            raise ValueError(f"Invalid URL target: {value!r}")
+        return parsed.hostname.rstrip(".").lower()
+    return value
 
 
 def classify_target(value: str) -> str:
-    value = value.strip()
+    value = normalize_target(value)
     try:
         network = ipaddress.ip_network(value, strict=False)
         return f"ipv{network.version}"
@@ -249,32 +299,96 @@ def load_targets(raw: str) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
     invalid: list[str] = []
-    for value in values:
+    for original in values:
         try:
+            value = normalize_target(original)
             classify_target(value)
         except ValueError:
-            # A target list of any real size (subdomain enumeration output,
-            # a cloud asset inventory, etc.) will realistically contain
-            # some malformed entries. One bad line shouldn't abort the
-            # whole run -- skip it, report it clearly, and keep going with
-            # everything that's actually valid.
-            invalid.append(value)
+            invalid.append(original)
             continue
         if value not in seen:
             seen.add(value)
             result.append(value)
 
     if invalid:
-        print(
-            f"[!] Skipped {len(invalid)} invalid target(s) (not a valid IP/CIDR/hostname): "
-            + ", ".join(repr(v) for v in invalid)
-        )
-
+        print(f"[!] Skipped {len(invalid)} invalid target(s): " + ", ".join(repr(v) for v in invalid))
     if not result:
         die("No valid targets remained after filtering invalid entries.")
-
     return result
 
+
+def infer_assessment_type(targets: list[str]) -> str:
+    private = public = False
+    for target in targets:
+        try:
+            network = ipaddress.ip_network(target, strict=False)
+        except ValueError:
+            continue
+        if network.is_private or network.is_link_local:
+            private = True
+        else:
+            public = True
+    if private and not public:
+        return "internal"
+    return "external"
+
+
+def normalize_client_domains(values: list[str]) -> list[str]:
+    result = []
+    for raw in values:
+        for item in raw.split(","):
+            domain = item.strip().lower().rstrip(".")
+            if domain and HOSTNAME_RE.fullmatch(domain) and domain not in result:
+                result.append(domain)
+    return result
+
+
+def external_passive_tool_status() -> dict[str, str | None]:
+    return {name: shutil.which(name) for name in ("subfinder", "amass", "assetfinder", "findomain")}
+
+
+def passive_subdomain_enumeration(domains: list[str], database_root: Path) -> set[str]:
+    """Run installed passive-only CLI enumerators and merge authorized-domain results."""
+    status = external_passive_tool_status()
+    print("[*] Passive external enumeration capability check:")
+    install = {
+        "subfinder": "go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest",
+        "amass": "sudo apt install -y amass",
+        "assetfinder": "go install github.com/tomnomnom/assetfinder@latest",
+        "findomain": "Install Findomain from its official GitHub release/package for your OS",
+    }
+    for name, path in status.items():
+        print(f"    {'[+]' if path else '[-]'} {name:<12} {'FOUND' if path else 'MISSING'}")
+        if not path:
+            print(f"        install: {install[name]}")
+
+    found: set[str] = set()
+    provenance: dict[str, set[str]] = {}
+    commands = {
+        "subfinder": lambda d: [status["subfinder"], "-silent", "-d", d],
+        "amass": lambda d: [status["amass"], "enum", "-passive", "-d", d],
+        "assetfinder": lambda d: [status["assetfinder"], "--subs-only", d],
+        "findomain": lambda d: [status["findomain"], "-q", "-t", d],
+    }
+    for domain in domains:
+        for tool, path in status.items():
+            if not path:
+                continue
+            try:
+                cp = subprocess.run(commands[tool](domain), text=True, capture_output=True, timeout=300, check=False)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                print(f"[!] {tool} failed for {domain}: {exc}", file=sys.stderr)
+                continue
+            for line in cp.stdout.splitlines():
+                host = line.strip().lower().rstrip(".")
+                if HOSTNAME_RE.fullmatch(host) and (host == domain or host.endswith("." + domain)):
+                    found.add(host)
+                    provenance.setdefault(host, set()).add(tool)
+
+    write_lines(database_root / "domain_discovery_list.txt", sorted(found))
+    write_lines(database_root / "subdomain_sources.txt", [f"{h}\t{','.join(sorted(provenance[h]))}" for h in sorted(provenance)])
+    print(f"[*] Passive enumeration merged {len(found)} unique in-scope hostname(s).")
+    return found
 
 def resolve_hostname(
     hostname: str,
@@ -414,14 +528,59 @@ def split_targets(
             futures = [executor.submit(do_lookup, item) for item in lookups]
             for future in concurrent.futures.as_completed(futures):
                 hostname, family, addresses = future.result()
+                if family == 6 and addresses:
+                    # Preserve the hostname for IPv6 scans. Nmap is invoked with
+                    # -6 --resolve-all -n so every AAAA target address is scanned.
+                    ipv6.add(hostname)
                 for address in addresses:
-                    (ipv4 if family == 4 else ipv6).add(address)
+                    if family == 4:
+                        ipv4.add(address)
                     mappings.add((hostname, address, "forward-target", family))
                 completed += 1
                 if completed % report_every == 0 or completed == len(lookups):
                     print(f"[*] Resolved {completed}/{len(lookups)} hostname lookup(s)...")
 
     return sorted(ipv4), sorted(ipv6), mappings
+
+
+def classify_hostname_ipv6(
+    targets: list[str],
+    dns_server: str | None = None,
+    workers: int = 16,
+) -> tuple[list[tuple[str, str]], list[str]]:
+    """Resolve AAAA records for hostname targets regardless of IPv6 scan choice."""
+    hostnames = sorted({
+        target.rstrip(".").lower()
+        for target in targets
+        if classify_target(target) == "hostname"
+    })
+    if not hostnames:
+        return [], []
+
+    print(f"[*] Checking AAAA records for {len(hostnames)} hostname target(s)...")
+    with_ipv6: list[tuple[str, str]] = []
+    without_ipv6: list[str] = []
+
+    def lookup(hostname: str) -> tuple[str, set[str]]:
+        return hostname, resolve_hostname(hostname, 6, dns_server)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(lookup, hostname) for hostname in hostnames]
+        for future in concurrent.futures.as_completed(futures):
+            hostname, addresses = future.result()
+            if addresses:
+                for address in sorted(addresses, key=ipaddress.ip_address):
+                    with_ipv6.append((hostname, address))
+            else:
+                without_ipv6.append(hostname)
+
+    with_ipv6.sort(key=lambda item: (item[0], ipaddress.ip_address(item[1])))
+    without_ipv6.sort()
+    print(
+        f"[*] IPv6 DNS classification: {len({h for h, _ in with_ipv6})} hostname(s) with AAAA; "
+        f"{len(without_ipv6)} without AAAA."
+    )
+    return with_ipv6, without_ipv6
 
 
 def _expand_port_tokens(value: str) -> set[int]:
@@ -575,13 +734,41 @@ def write_lines(path: Path, values: Iterable[str]) -> None:
 
 
 def nmap_family_arg(family: int) -> list[str]:
-    return ["-6"] if family == 6 else []
+    # For IPv6 hostname targets, --resolve-all ensures all AAAA addresses are
+    # considered. -n suppresses reverse-DNS lookups while target resolution
+    # still occurs for hostnames supplied on the command line/input file.
+    return ["-6", "--resolve-all", "-n"] if family == 6 else []
 
 
 def discovery_command(nmap: str, context: FamilyContext, dns: str | None) -> list[str]:
-    command = [nmap, *nmap_family_arg(context.family), "-sn", "--reason", "-v",
-               "-iL", str(context.original_targets_file),
-               "-oA", str(context.discovery_dir / "host_discovery")]
+    # Layer several discovery probes in the same spirit as mature scanners:
+    # ICMP plus TCP SYN/ACK and UDP probes. Nmap also uses ARP/ND automatically
+    # for directly connected Ethernet targets. Avoid raw-packet-only probes for
+    # unprivileged users, where Nmap's connect-based discovery is safer.
+    probes: list[str]
+    if os.geteuid() == 0:
+        if context.family == 4:
+            probes = [
+                "-PE", "-PP", "-PM",
+                "-PS22,80,135,139,443,445,3389",
+                "-PA80,443,445",
+                "-PU53,123,161",
+            ]
+        else:
+            probes = [
+                "-PE",
+                "-PS22,80,135,139,443,445,3389",
+                "-PA80,443,445",
+                "-PU53,123,161",
+            ]
+    else:
+        probes = ["-PS80,443", "-PA80,443"]
+
+    command = [
+        nmap, *nmap_family_arg(context.family), "-sn", *probes,
+        "--reason", "-v", "-iL", str(context.original_targets_file),
+        "-oA", str(context.discovery_dir / "host_discovery"),
+    ]
     if dns:
         command += ["--dns-servers", dns]
     return command
@@ -711,87 +898,43 @@ def final_command(
     return command
 
 
-def make_job(screen: str, session: str, label: str, command: list[str], work_dir: Path) -> ScreenJob:
-    result = subprocess.run([screen, "-ls"], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    if re.search(rf"\d+\.{re.escape(session)}\s", result.stdout):
-        die(f"Screen session already exists: {session}")
+def run_scan_command(label: str, command: list[str], work_dir: Path) -> int:
+    """Run a scan in the foreground and tee combined output to a log file."""
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", label)
-    done = work_dir / f".{safe}.done"
-    exit_file = work_dir / f".{safe}.exit"
     log_file = work_dir / f"{safe}.log"
-    wrapper = work_dir / f"run_{safe}.sh"
-    # The command's stdout/stderr previously went straight to the Screen
-    # session's own terminal only -- nothing was ever captured to disk, so
-    # a failure's actual error message was unrecoverable the moment the
-    # session closed (which happens automatically once the command exits).
-    # Piping through `tee` keeps the live view intact for anyone attached
-    # via `screen -r` while also persisting everything to log_file.
-    # PIPESTATUS[0] (not $?) is required to get the real command exit code
-    # rather than tee's own exit code.
-    wrapper.write_text(
-        "#!/usr/bin/env bash\nset +e\n"
-        + " ".join(shlex.quote(x) for x in command)
-        + " 2>&1 | tee " + shlex.quote(str(log_file))
-        + "\ncode=${PIPESTATUS[0]}\nprintf '%s\\n' \"$code\" > "
-        + shlex.quote(str(exit_file))
-        + "\ntouch " + shlex.quote(str(done))
-        + "\nexit \"$code\"\n",
-        encoding="utf-8",
-    )
-    wrapper.chmod(0o700)
-    return ScreenJob(session, label, command, work_dir, done, exit_file, wrapper, log_file, time.monotonic())
-
-
-def start_jobs(screen: str, jobs: list[ScreenJob]) -> None:
-    for job in jobs:
-        subprocess.run([screen, "-DmS", job.session, "bash", str(job.wrapper)], check=True)
-        ACTIVE_SCREEN_SESSIONS.add(job.session)
-        print(f"[*] Started {job.label} in Screen session {job.session!r}")
-
-
-def wait_jobs(screen: str, jobs: list[ScreenJob]) -> dict[str, int]:
-    remaining = {job.session: job for job in jobs}
-    results: dict[str, int] = {}
+    started = time.monotonic()
+    print(f"[*] Running {label} in the current Bayabas process.")
     try:
-        while remaining:
-            for session, job in list(remaining.items()):
-                if not job.done_file.exists():
-                    continue
-                try:
-                    code = int(job.exit_file.read_text(encoding="utf-8").strip())
-                except (FileNotFoundError, ValueError):
-                    code = 1
-                elapsed = int(time.monotonic() - job.started)
-                results[session] = code
-                print(f"\a[*] {job.label} completed after {elapsed}s (exit {code}).")
-                if code != 0:
-                    print(f"[!] Full output saved to: {job.log_file}")
-                remaining.pop(session)
-            if remaining:
-                time.sleep(2)
+        with log_file.open("w", encoding="utf-8", errors="replace") as log:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            assert process.stdout is not None
+            for line in process.stdout:
+                print(line, end="")
+                log.write(line)
+                log.flush()
+            code = process.wait()
     except KeyboardInterrupt as exc:
-        sessions = ", ".join(sorted(remaining))
-        print(
-            "\n[!] Interrupt received. Active scans remain detached in Screen: "
-            f"{sessions}",
-            file=sys.stderr,
-        )
+        if 'process' in locals() and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        print(f"\n[!] Interrupted {label}; the scan process was stopped.", file=sys.stderr)
         raise GracefulInterrupt from exc
-    finally:
-        for job in jobs:
-            if job.done_file.exists():
-                ACTIVE_SCREEN_SESSIONS.discard(job.session)
-                subprocess.run(
-                    [screen, "-S", job.session, "-X", "quit"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
-                )
-    return results
 
-
-def run_one_screen(screen: str, session: str, label: str, command: list[str], work_dir: Path) -> int:
-    job = make_job(screen, session, label, command, work_dir)
-    start_jobs(screen, [job])
-    return wait_jobs(screen, [job])[session]
+    elapsed = int(time.monotonic() - started)
+    print(f"\a[*] {label} completed after {elapsed}s (exit {code}).")
+    if code != 0:
+        print(f"[!] Full output saved to: {log_file}")
+    return code
 
 
 def reverse_names(address: str) -> set[str]:
@@ -1701,7 +1844,6 @@ def update_interrupted_assessment() -> None:
         data = json.loads(CURRENT_ASSESSMENT_PATH.read_text(encoding="utf-8"))
         data["status"] = "interrupted"
         data["end_time"] = datetime.now(timezone.utc).isoformat()
-        data["active_screen_sessions"] = sorted(ACTIVE_SCREEN_SESSIONS)
         CURRENT_ASSESSMENT_PATH.write_text(
             json.dumps(data, indent=2, sort_keys=True),
             encoding="utf-8",
@@ -1715,7 +1857,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("targets", nargs="?", help="Target file, comma-separated targets, or one target")
     p.add_argument("--dns-server")
     p.add_argument("--quick", action="store_true")
-    p.add_argument("--host-discovery", action="store_true")
+    p.add_argument("--host-discovery", action="store_true", help=argparse.SUPPRESS)
     p.add_argument(
         "--import-nmap",
         action="append",
@@ -1726,6 +1868,8 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("--ipv6", action="store_true", help="Also resolve and scan IPv6 targets")
+    p.add_argument("--assessment-type", choices=["internal", "external"], help="Targets-file assessment type")
+    p.add_argument("--client-domain", action="append", default=[], help="Authorized client root domain for DNS enumeration (repeatable)")
     p.add_argument("--ports")
     p.add_argument("--max-retries")
     p.add_argument("--max-scan-delay")
@@ -1813,7 +1957,7 @@ def main() -> int:
     global CURRENT_ASSESSMENT_PATH
     args = parser().parse_args()
     MODULES_DIR.mkdir(parents=True, exist_ok=True)
-    nmap, screen = ensure_dependencies()
+    nmap = ensure_dependencies()
 
     # Select import-vs-scan before requesting any targets.
     import_files = [
@@ -1847,8 +1991,12 @@ def main() -> int:
         die("Invalid DNS server.")
 
     host_discovery = False
-    plan = PortPlan([], False, False, "imported Nmap output")
+    plan = PortPlan([], False, False, "pending scan configuration")
     timing: list[str] = []
+    ipv6_dns_with: list[tuple[str, str]] = []
+    ipv6_dns_without: list[str] = []
+    assessment_type = "import"
+    client_domains: list[str] = []
 
     if not import_mode:
         raw = args.targets
@@ -1862,8 +2010,24 @@ def main() -> int:
             die("Targets are required when an existing Nmap scan is not imported.")
 
         targets = load_targets(raw)
+        advise_terminal_multiplexer(estimate_target_scale(targets), args.non_interactive)
 
+        assessment_type = args.assessment_type or infer_assessment_type(targets)
+        if not args.non_interactive:
+            print(f"[*] Recommended assessment type: {assessment_type.upper()}")
+            if not yes_no(f"Use {assessment_type.upper()} workflow?", True):
+                assessment_type = "internal" if assessment_type == "external" else "external"
+        client_domains = normalize_client_domains(args.client_domain)
+        if not args.non_interactive and not client_domains:
+            entered = prompt("Client domain(s) for authorized DNS enumeration (comma-separated, blank = skip)", "")
+            client_domains = normalize_client_domains([entered]) if entered else []
+        print(f"[*] Assessment workflow: {assessment_type.upper()}")
+        if client_domains:
+            print("[*] Authorized client domain(s): " + ", ".join(client_domains))
+
+        # External passive enumeration is performed after the Database directory exists.
         preflight_mappings = run_core_resolution(targets, dns)
+        ipv6_dns_with, ipv6_dns_without = classify_hostname_ipv6(targets, dns)
 
         ipv6_enabled = args.ipv6
         if not args.non_interactive:
@@ -1889,12 +2053,10 @@ def main() -> int:
         if not ipv4_targets and not ipv6_targets:
             die("No targets resolved for the selected address families.")
 
-        host_discovery = args.host_discovery
-
-        if not args.non_interactive:
-            host_discovery = yes_no("Run host discovery first?", True)
-
-        plan, timing = collect_scan_options(args)
+        # With raw targets and no imported Nmap inventory, discovery is a
+        # mandatory pre-scan stage. This intentionally happens before port
+        # and timing prompts so dead hosts are removed from scan scope first.
+        host_discovery = True
 
     output_dir = args.output_dir
 
@@ -1972,6 +2134,8 @@ def main() -> int:
         "ipv6_enabled": bool(ipv6_targets),
         "host_discovery": host_discovery,
         "intake_mode": "import" if import_mode else "scan",
+        "assessment_type": assessment_type,
+        "client_domains": client_domains,
         "port_plan": {},
         "commands": {},
         "statistics": {},
@@ -1979,8 +2143,6 @@ def main() -> int:
     }
     if import_mode:
         assessment["port_plan"] = {"description": "imported Nmap output"}
-    else:
-        save_requested_port_scope(assessment_root, plan, assessment)
     write_assessment(assessment_path, assessment)
 
     contexts: list[FamilyContext] = []
@@ -1989,7 +2151,6 @@ def main() -> int:
     if ipv6_targets:
         contexts.append(make_family_context(assessment_root, 6, ipv6_targets))
 
-    final_jobs: list[ScreenJob] = []
     final_commands: dict[int, list[str]] = {}
     final_inventory: dict[int, tuple[list[int], list[int], list[str]]] = {}
 
@@ -2079,37 +2240,90 @@ def main() -> int:
 
         return 0
 
+    # Scan intake: perform liveness discovery before asking about ports/timing.
+    database_root = assessment_root / "Database"
+    database_root.mkdir(parents=True, exist_ok=True)
+    if assessment_type == "external" and client_domains:
+        passive_names = passive_subdomain_enumeration(client_domains, database_root)
+        if passive_names:
+            passive_mappings = run_core_resolution(sorted(passive_names), dns)
+            explicit_mappings.update((h, a, src, ipaddress.ip_address(a).version) for h, a, src in passive_mappings)
+            resolved_v4 = sorted({a for _h, a, _s in passive_mappings if ipaddress.ip_address(a).version == 4}, key=ipaddress.ip_address)
+            resolved_v6 = sorted({a for _h, a, _s in passive_mappings if ipaddress.ip_address(a).version == 6}, key=ipaddress.ip_address)
+            write_lines(database_root / "domain_discovery_resolved_ipv4.txt", resolved_v4)
+            write_lines(database_root / "domain_discovery_resolved_ipv6.txt", resolved_v6)
+            # Passive findings are intelligence only in this revision: they do not silently expand Nmap scope.
+            print("[*] Passive DNS findings recorded as intelligence; supplied target scope is unchanged.")
+    write_lines(
+        database_root / "hostnames_with_ipv6.txt",
+        [f"{hostname}\t{address}" for hostname, address in ipv6_dns_with],
+    )
+    write_lines(database_root / "hostnames_without_ipv6.txt", ipv6_dns_without)
+
+    discovered_all: set[str] = set()
+    usable_contexts: list[FamilyContext] = []
     for context in contexts:
         write_lines(context.original_targets_file, context.targets)
-        initial_targets = context.original_targets_file
+        command = discovery_command(nmap, context, dns)
+        save_command(
+            assessment_root,
+            f"{context.label}_discovery",
+            command,
+            context.discovery_dir,
+            assessment,
+        )
+        print("[*] " + " ".join(shlex.quote(x) for x in command))
+        if args.print_command:
+            # Keep the downstream command plan printable even though discovery
+            # output does not exist yet in command-only mode.
+            usable_contexts.append(context)
+            continue
 
-        if host_discovery:
-            command = discovery_command(nmap, context, dns)
-            save_command(
-                assessment_root,
-                f"{context.label}_discovery",
-                command,
-                context.discovery_dir,
-                assessment,
-            )
-            print("[*] " + " ".join(shlex.quote(x) for x in command))
-            if not args.print_command:
-                code = run_one_screen(
-                    screen, f"bayabas-{context.label.lower()}-discovery",
-                    f"{context.label} host discovery", command, context.discovery_dir
-                )
-                xml = context.discovery_dir / "host_discovery.xml"
-                if code != 0 or not xml.exists():
-                    print(f"[!] {context.label} discovery failed; skipping this family.", file=sys.stderr)
-                    continue
-                discovered = extract_up_hosts(xml, context.family)
-                if not discovered:
-                    print(f"[*] {context.label} discovery found no live hosts.")
-                    continue
-                write_lines(context.discovery_targets_file, discovered)
-                initial_targets = context.discovery_targets_file
+        code = run_scan_command(f"{context.label} host discovery", command, context.discovery_dir)
+        xml = context.discovery_dir / "host_discovery.xml"
+        if code != 0 or not xml.exists():
+            print(f"[!] {context.label} discovery failed; skipping this family.", file=sys.stderr)
+            continue
+        discovered = extract_up_hosts(xml, context.family)
+        write_lines(context.discovery_targets_file, discovered)
+        write_lines(context.db_root / "host_discovery_list.txt", discovered)
+        discovered_all.update(discovered)
+        if not discovered:
+            print(f"[*] {context.label} discovery found no live hosts.")
+            continue
+        print(f"[*] {context.label} discovery identified {len(discovered)} live host(s).")
+        usable_contexts.append(context)
 
-        command = initial_command(nmap, context, initial_targets, plan, timing, dns, host_discovery)
+    write_lines(
+        database_root / "host_discovery_list.txt",
+        sorted(discovered_all, key=lambda x: (ipaddress.ip_address(x).version, ipaddress.ip_address(x))),
+    )
+    assessment["artifacts"]["host_discovery_list"] = str(database_root / "host_discovery_list.txt")
+    assessment["artifacts"]["hostnames_with_ipv6"] = str(database_root / "hostnames_with_ipv6.txt")
+    assessment["artifacts"]["hostnames_without_ipv6"] = str(database_root / "hostnames_without_ipv6.txt")
+    assessment["statistics"]["discovered_live_hosts"] = len(discovered_all)
+    write_assessment(assessment_path, assessment)
+
+    if not usable_contexts and not args.print_command:
+        assessment["status"] = "completed-no-live-hosts"
+        assessment["end_time"] = datetime.now(timezone.utc).isoformat()
+        write_assessment(assessment_path, assessment)
+        print("[*] Host discovery found no live hosts; no port-scan prompts were shown.")
+        return 0
+
+    # Only after discovery do we ask for the actual scan scope/timing.
+    plan, timing = collect_scan_options(args)
+    save_requested_port_scope(assessment_root, plan, assessment)
+    write_assessment(assessment_path, assessment)
+
+    successful_contexts: list[FamilyContext] = []
+    for context in usable_contexts:
+        initial_targets = (
+            context.discovery_targets_file
+            if context.discovery_targets_file.exists() and context.discovery_targets_file.stat().st_size
+            else context.original_targets_file
+        )
+        command = initial_command(nmap, context, initial_targets, plan, timing, dns, True)
         save_command(
             assessment_root,
             f"{context.label}_initial",
@@ -2120,10 +2334,7 @@ def main() -> int:
         print("[*] " + " ".join(shlex.quote(x) for x in command))
         if args.print_command:
             continue
-        code = run_one_screen(
-            screen, f"bayabas-{context.label.lower()}-initial",
-            f"{context.label} initial port scan", command, context.initial_dir
-        )
+        code = run_scan_command(f"{context.label} initial port scan", command, context.initial_dir)
         xml = context.initial_dir / "initial_scan.xml"
         if code != 0 or not xml.exists():
             print(f"[!] {context.label} initial scan failed; skipping final scan.", file=sys.stderr)
@@ -2134,12 +2345,7 @@ def main() -> int:
             continue
         final_inventory[context.family] = (tcp, udp, live)
 
-        # All scan output names derive from the user-selected assessment directory.
-        # No separate initial/final output prompt is required.
-        context.final_output_base = validate_output_base(
-            "final_scan",
-            context.final_dir,
-        )
+        context.final_output_base = validate_output_base("final_scan", context.final_dir)
         command = final_command(nmap, context, timing, tcp, udp)
         final_commands[context.family] = command
         save_command(
@@ -2149,48 +2355,28 @@ def main() -> int:
             context.final_dir,
             assessment,
         )
-        final_jobs.append(
-            make_job(
-                screen, f"bayabas-{context.label.lower()}-final",
-                f"{context.label} final service scan", command, context.final_dir
-            )
-        )
-
-    write_assessment(assessment_path, assessment)
-    if args.print_command:
-        return 0
-    if not final_jobs:
-        assessment["status"] = "completed-no-open-services"
-        assessment["end_time"] = datetime.now(timezone.utc).isoformat()
-        write_assessment(assessment_path, assessment)
-        return 0
-
-    # IPv4 and IPv6 final scans start concurrently and remain protected by Screen.
-    start_jobs(screen, final_jobs)
-    results = wait_jobs(screen, final_jobs)
-
-    successful_contexts: list[FamilyContext] = []
-    for context in contexts:
-        command = final_commands.get(context.family)
-        if command is None or context.final_output_base is None:
-            continue
-        session = f"bayabas-{context.label.lower()}-final"
-        xml = Path(str(context.final_output_base) + ".xml")
-        if results.get(session) != 0 or not xml.exists():
+        print("[*] " + " ".join(shlex.quote(x) for x in command))
+        code = run_scan_command(f"{context.label} final service scan", command, context.final_dir)
+        final_xml = Path(str(context.final_output_base) + ".xml")
+        if code != 0 or not final_xml.exists():
             print(f"[!] {context.label} final scan failed.", file=sys.stderr)
             continue
-        _, _, live = final_inventory[context.family]
+
         mappings = collect_family_mappings(context.family, explicit_mappings, live, dns)
         write_resolution_files(context, mappings)
-        scan_id, hosts, ports = import_final(context, xml, command, mappings)
+        scan_id, hosts, ports = import_final(context, final_xml, command, mappings)
         inventory_stats = write_normalized_inventory(context)
         successful_contexts.append(context)
         assessment["statistics"][f"{context.label}_inventory"] = inventory_stats
         assessment["statistics"][f"{context.label}_hosts"] = hosts
         assessment["statistics"][f"{context.label}_port_records"] = ports
-        assessment["artifacts"][f"{context.label}_final_xml"] = str(xml)
+        assessment["artifacts"][f"{context.label}_final_xml"] = str(final_xml)
         assessment["artifacts"][f"{context.label}_database"] = str(context.db_path)
         print(f"[*] {context.label}: imported {hosts} hosts and {ports} port records (scan {scan_id}).")
+
+    write_assessment(assessment_path, assessment)
+    if args.print_command:
+        return 0
 
     run_selected = args.run_modules or bool(args.modules)
     if not args.non_interactive and not args.modules:
@@ -2217,13 +2403,5 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except (KeyboardInterrupt, GracefulInterrupt):
         update_interrupted_assessment()
-        if ACTIVE_SCREEN_SESSIONS:
-            print(
-                "\n[!] Bayabas exited gracefully. Active Screen sessions remain running:",
-                file=sys.stderr,
-            )
-            for session in sorted(ACTIVE_SCREEN_SESSIONS):
-                print(f"    screen -r {session}", file=sys.stderr)
-        else:
-            print("\n[!] Bayabas exited gracefully.", file=sys.stderr)
+        print("\n[!] Bayabas exited gracefully; no detached scan sessions were left running.", file=sys.stderr)
         raise SystemExit(130)
