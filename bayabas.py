@@ -38,7 +38,7 @@ except ImportError:
     readline = None
 
 APP = "Bayabas"
-VERSION = "0.10.22"
+VERSION = "0.10.24"
 ROOT = Path(__file__).resolve().parent
 MODULES_DIR = ROOT / "Modules"
 
@@ -786,40 +786,159 @@ def _interactive_port_plan() -> PortPlan:
     if c=="15": return PortPlan(["-p","T:1-65535,U:1-65535"], True, True, "TCP all + UDP all")
     die("Invalid Interactive Scan selection.")
 
-_USER_FLAG_VALUE_OPTS={"-p","--top-ports","--max-retries","--max-scan-delay","--min-parallelism","--min-rate","--max-rate","--min-hostgroup","--max-hostgroup","--mtu","--host-timeout","--scan-delay","--version-intensity"}
-_USER_FLAG_NO_VALUE={"-sS","-sT","-sU","-Pn","-n","-v","-vv","--open","--reason","-F","-T0","-T1","-T2","-T3","-T4","-T5","-p-"}
-_BAYABAS_MANAGED={"-iL","-oA","-oN","-oX","-oG"}
-_COMMON_FLAG_TYPOS={"--opne":"--open","--reson":"--reason","--reasn":"--reason","--max-retrys":"--max-retries","--min-paralellism":"--min-parallelism"}
+_BAYABAS_MANAGED = {"-iL", "-oA", "-oN", "-oX", "-oG"}
+_COMMON_FLAG_TYPOS = {
+    "--opne": "--open",
+    "--reson": "--reason",
+    "--reasn": "--reason",
+    "--max-retrys": "--max-retries",
+    "--min-paralellism": "--min-parallelism",
+}
+
+
+def _managed_user_flag(token: str) -> str | None:
+    """Return the Bayabas-managed option represented by token, if any."""
+    for option in _BAYABAS_MANAGED:
+        if token == option:
+            return option
+        # Catch attached/equals forms such as -oA/tmp/x or -iL=targets.txt.
+        if token.startswith(option + "="):
+            return option
+        if len(option) == 3 and token.startswith(option) and len(token) > len(option):
+            return option
+    return None
+
+
+def _user_flag_scan_modes(tokens: list[str]) -> tuple[bool, bool]:
+    """Best-effort TCP/UDP inference without restricting valid Nmap syntax."""
+    tcp = False
+    udp = False
+    for token in tokens:
+        # Normal and combined Nmap scan-type syntax, e.g. -sS, -sU, -sSU.
+        if token.startswith("-s") and len(token) > 2:
+            modes = token[2:]
+            if "U" in modes:
+                udp = True
+            if any(mode in modes for mode in ("S", "T", "A", "W", "M", "N", "F", "X")):
+                tcp = True
+    # With no explicit port-scan type Nmap itself chooses its normal TCP default.
+    if not tcp and not udp:
+        tcp = True
+    return tcp, udp
+
 
 def _validate_user_flags(raw: str) -> PortPlan:
-    tokens=shlex.split(raw)
-    if not tokens: raise ValueError("No Nmap flags supplied.")
-    if tokens[0].lower().endswith("nmap"): raise ValueError("Enter flags only; do not include `nmap`.")
-    clean=[]; tcp=False; udp=False; port_expr=None; i=0
-    while i<len(tokens):
-        t=tokens[i]
-        if t in _BAYABAS_MANAGED: raise ValueError(f"{t} is Bayabas-managed.")
-        if t in _COMMON_FLAG_TYPOS: raise ValueError(f"Unknown option {t}. Did you mean {_COMMON_FLAG_TYPOS[t]}?")
-        if not t.startswith("-"): raise ValueError(f"Unexpected target/value `{t}`; Bayabas manages targets.")
-        if t in {"-sS","-sT"}: tcp=True
-        if t=="-sU": udp=True
-        if t in _USER_FLAG_VALUE_OPTS:
-            if i+1>=len(tokens): raise ValueError(f"{t} requires a value.")
-            v=tokens[i+1]
-            if t=="-p": port_expr=v
-            clean.extend([t,v]); i+=2; continue
-        if t not in _USER_FLAG_NO_VALUE: raise ValueError(f"Unknown/unsupported User Flag `{t}`.")
-        if t not in clean: clean.append(t)
-        i+=1
-    if "-sT" in clean and "--mtu" in clean: raise ValueError("Flag mismatch: --mtu is incompatible with -sT.")
-    if "-sS" in clean and "-sT" in clean: raise ValueError("Flag mismatch: choose -sS or -sT, not both.")
-    if port_expr:
-        up=port_expr.upper()
-        if "U:" in up and not udp: raise ValueError("Protocol mismatch: UDP ports supplied but -sU is missing.")
-        if "T:" in up and not tcp: raise ValueError("Protocol mismatch: TCP ports supplied but -sS/-sT is missing.")
-    if not tcp and not udp:
-        tcp=True; clean.insert(0,"-sS")
-    return PortPlan([],tcp,udp,"User Flags",user_flags=tuple(clean))
+    """
+    Keep User Flags close to native Nmap syntax.
+
+    Bayabas intentionally does NOT maintain an allow-list of Nmap options.
+    Nmap is authoritative for whether an option is supported by the installed
+    Nmap version. We only reject arguments that interfere with Bayabas'
+    target/output ownership and catch a small set of known contradictions.
+    """
+    try:
+        tokens = shlex.split(raw)
+    except ValueError as exc:
+        raise ValueError(f"Could not parse User Flags: {exc}") from exc
+
+    if not tokens:
+        raise ValueError("No Nmap flags supplied.")
+
+    if Path(tokens[0]).name.lower() == "nmap":
+        raise ValueError("Enter Nmap flags only; do not include the `nmap` command.")
+
+    # Friendly typo hints for common mistakes, while leaving general validation
+    # to the installed Nmap binary.
+    for token in tokens:
+        option_name = token.split("=", 1)[0]
+        if option_name in _COMMON_FLAG_TYPOS:
+            raise ValueError(
+                f"Possible typo: {option_name}. "
+                f"Did you mean {_COMMON_FLAG_TYPOS[option_name]}?"
+            )
+
+    # Bayabas must own target input and output paths for parsing/resume.
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        managed = _managed_user_flag(token)
+        if managed:
+            raise ValueError(
+                f"{managed} is managed by Bayabas. "
+                "Do not provide -iL or Nmap output options in User Flags."
+            )
+        i += 1
+
+    # Known semantic mismatch: --mtu cannot be used with TCP Connect (-sT).
+    has_st = any(
+        token == "-sT" or (token.startswith("-s") and "T" in token[2:])
+        for token in tokens
+    )
+    has_ss = any(
+        token == "-sS" or (token.startswith("-s") and "S" in token[2:])
+        for token in tokens
+    )
+    has_mtu = any(
+        token == "--mtu" or token.startswith("--mtu=")
+        for token in tokens
+    )
+    if has_st and has_mtu:
+        raise ValueError(
+            "Flag mismatch: --mtu is incompatible with TCP Connect scan (-sT)."
+        )
+    if has_st and has_ss:
+        raise ValueError(
+            "Flag mismatch: -sS and -sT request conflicting TCP scan types."
+        )
+
+    tcp, udp = _user_flag_scan_modes(tokens)
+    return PortPlan(
+        [],
+        tcp,
+        udp,
+        "User Flags",
+        user_flags=tuple(tokens),
+    )
+
+
+def prompt_user_flags(previous: str | None = None) -> tuple[PortPlan, str]:
+    print("""\n============================================================
+ USER FLAGS
+============================================================
+Enter Nmap flags only. Bayabas manages targets, -iL and output paths.
+
+Examples:
+ TCP:
+   -sS -Pn -v --open --reason -p 22,80,443
+
+ UDP:
+   -sU -Pn --open --reason -p 53,123,161
+
+ TCP + UDP:
+   -sSU -Pn --open --reason -p T:22,80,443,U:53,123,161
+
+ Native Nmap long-option syntax:
+   --open -v --min-parallelism=1000 --max-retries=0 \
+--max-scan-delay=2ms -sSU -Pn
+
+ Full TCP:
+   -sS -Pn -p- --max-retries=1 --min-rate=500
+
+Most valid options accepted by your installed Nmap are passed through unchanged.
+If Nmap rejects the command, Bayabas will show the error and let you edit/retry.
+""")
+    default = previous or "-sS -Pn -v --open --reason -p 80,443"
+    while True:
+        raw = prompt("User flags", default)
+        try:
+            plan = _validate_user_flags(raw)
+            print("[+] User Flags preflight: PASS")
+            return plan, raw
+        except ValueError as exc:
+            print(f"[!] {exc}", file=sys.stderr)
+            if not yes_no("Edit User Flags and retry?", True):
+                die("User Flags validation cancelled.")
+
 
 def collect_scan_options(args: argparse.Namespace) -> tuple[PortPlan, list[str]]:
     if args.non_interactive:
@@ -833,24 +952,8 @@ def collect_scan_options(args: argparse.Namespace) -> tuple[PortPlan, list[str]]
 """)
         mode=prompt("Select","1")
         if mode=="2":
-            print("""\n============================================================
- USER FLAGS
-============================================================
-Enter Nmap flags only. Bayabas manages targets and output paths.
-Examples:
- TCP:       -sS -Pn -v --open --reason -p 22,80,443
- UDP:       -sU -Pn --open --reason -p 53,123,161
- TCP + UDP: -sS -sU -Pn --open --reason -p T:22,80,443,U:53,123,161
- Full TCP:  -sS -Pn -p- --max-retries 1 --min-rate 500
-""")
-            while True:
-                try:
-                    plan=_validate_user_flags(prompt("User flags","-sS -Pn -v --open --reason -p 80,443"))
-                    print("[+] User Flags validation: PASS")
-                    return plan,[]
-                except ValueError as exc:
-                    print(f"[!] {exc}",file=sys.stderr)
-                    if not yes_no("Edit User Flags and retry?",True): die("User Flags validation failed.")
+            plan, _raw_user_flags = prompt_user_flags()
+            return plan,[]
         if mode!="1": die("Invalid scan configuration mode.")
         plan=_interactive_port_plan()
 
@@ -1964,8 +2067,29 @@ def run_module_menu(
         if not yes_no("Would you like to run another module before exiting gracefully?", False):
             return
 
+def _json_safe(value: Any) -> Any:
+    """Return a JSON-safe representation of assessment/module metadata."""
+    if isinstance(value, dict):
+        safe: dict[str, Any] = {}
+        for key, item in value.items():
+            if isinstance(key, tuple):
+                safe_key = " / ".join(str(part) for part in key)
+            else:
+                safe_key = str(key)
+            safe[safe_key] = _json_safe(item)
+        return safe
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
 def write_assessment(path: Path, assessment: dict[str, Any]) -> None:
-    path.write_text(json.dumps(assessment, indent=2, sort_keys=True), encoding="utf-8")
+    path.write_text(
+        json.dumps(_json_safe(assessment), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
 
 
 
@@ -2213,7 +2337,7 @@ def write_target_intelligence_artifacts(
     with_v6_hosts = sorted({h for h, _ in ipv6_dns_with})
 
     cloud_records=[]
-    provider_counts: dict[tuple[str,str], int] = {}
+    provider_counts: dict[str, int] = {}
     for host in hostnames:
         hit=classify_shared_provider_hostname(host)
         if hit:
@@ -2226,7 +2350,8 @@ def write_target_intelligence_artifacts(
                 "classification": "EXPLICIT_CLOUD_RESOURCE",
                 "scope": "EXPLICIT_TARGET",
             })
-            provider_counts[(provider,service)] = provider_counts.get((provider,service),0)+1
+            provider_key = f"{provider} / {service}"
+            provider_counts[provider_key] = provider_counts.get(provider_key, 0) + 1
 
     # Human-readable DNS summary + per-host records.
     lines=[
@@ -2817,10 +2942,69 @@ def main() -> int:
         print("[*] " + " ".join(shlex.quote(x) for x in command))
         if args.print_command:
             continue
-        code = run_scan_command(f"{context.label} initial port scan", command, context.initial_dir)
-        xml = context.initial_dir / "initial_scan.xml"
+        while True:
+            code = run_scan_command(
+                f"{context.label} initial port scan",
+                command,
+                context.initial_dir,
+            )
+            xml = context.initial_dir / "initial_scan.xml"
+
+            if code == 0 and xml.exists():
+                break
+
+            print(
+                f"[!] {context.label} initial scan failed (Nmap exit {code}).",
+                file=sys.stderr,
+            )
+            print(
+                f"[!] Full Nmap output: "
+                f"{context.initial_dir / (context.label + '_initial_port_scan.log')}",
+                file=sys.stderr,
+            )
+
+            if not plan.user_flags or args.non_interactive:
+                print(
+                    f"[!] {context.label} initial scan failed; skipping final scan.",
+                    file=sys.stderr,
+                )
+                break
+
+            print("\nNmap rejected or failed the User Flags command.")
+            print("Previous User Flags:")
+            print("    " + " ".join(shlex.quote(x) for x in plan.user_flags))
+            print("""
+What would you like to do?
+
+ [1] Edit User Flags and retry
+ [2] Stop this address-family scan
+""")
+            retry_choice = prompt("Select", "1")
+            if retry_choice != "1":
+                break
+
+            previous_flags = " ".join(shlex.quote(x) for x in plan.user_flags)
+            plan, _raw_user_flags = prompt_user_flags(previous_flags)
+            command = initial_command(
+                nmap,
+                context,
+                initial_targets,
+                plan,
+                [],
+                dns,
+                True,
+            )
+            save_command(
+                assessment_root,
+                f"{context.label}_initial",
+                command,
+                context.initial_dir,
+                assessment,
+            )
+            print("[*] Retrying with:")
+            print("[*] " + " ".join(shlex.quote(x) for x in command))
+
         if code != 0 or not xml.exists():
-            print(f"[!] {context.label} initial scan failed; skipping final scan.", file=sys.stderr)
             continue
         tcp, udp, live = extract_initial(xml, context)
         if not live or (not tcp and not udp):
@@ -2888,3 +3072,4 @@ if __name__ == "__main__":
         update_interrupted_assessment()
         print("\n[!] Bayabas exited gracefully; no detached scan sessions were left running.", file=sys.stderr)
         raise SystemExit(130)
+
